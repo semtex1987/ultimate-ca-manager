@@ -29,8 +29,12 @@ class CASigningMixin:
 
     @staticmethod
     def _check_ca_offline(ca: CA) -> None:
-        """Raise CAOfflineError if the CA cannot sign (offline, revoked or pending)."""
-        if ca.offline:
+        """Raise CAOfflineError if the CA cannot sign (offline, revoked or pending).
+
+        A SmartCard-HSM signing window is the sole operator exception to ``ca.offline``.
+        """
+        from services.hsm.signing_window import operator_offline_blocks
+        if operator_offline_blocks(ca):
             raise CAOfflineError(
                 f"CA '{ca.descr}' is offline: {ca.offline_reason or 'no reason provided'}"
             )

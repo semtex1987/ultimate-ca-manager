@@ -9,6 +9,8 @@ case "$1" in
         # Stop service
         systemctl stop ucm.service >/dev/null 2>&1 || true
         systemctl disable ucm.service >/dev/null 2>&1 || true
+        systemctl stop ucm-ram-bridge.service >/dev/null 2>&1 || true
+        systemctl disable ucm-ram-bridge.service >/dev/null 2>&1 || true
         
         echo "UCM service stopped and disabled"
         echo "Data preserved in /var/lib/ucm"

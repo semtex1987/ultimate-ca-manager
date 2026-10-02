@@ -5,6 +5,7 @@ Supports PKCS#11, Azure Key Vault, Google Cloud KMS, AWS CloudHSM
 
 from datetime import datetime
 import json
+from typing import Optional
 from utils.datetime_utils import utc_now, utc_isoformat
 from utils.encryption import encrypt_if_needed, decrypt_if_needed, is_encrypted
 
@@ -23,6 +24,9 @@ _SENSITIVE_KEYS = frozenset({
     'password', 'hsm_password',
     'secret', 'client_secret',
     'token',                       # openbao token (NOT token_label)
+    'connect_token',               # sc-hsm-cloud custodian ceremony URL token
+    'wrapped_root',                # DKEK-wrapped root blob
+    'wrapped_root_blob',
     'service_account_json',        # gcp — contains private_key
     'private_key',
     'credential', 'access_key_secret',
@@ -71,15 +75,20 @@ class HsmProvider(db.Model if db else object):
     creator = db.relationship('User', foreign_keys=[created_by])
     
     # Valid provider types
-    VALID_TYPES = ['pkcs11', 'aws-cloudhsm', 'azure-keyvault', 'google-kms', 'openbao']
+    VALID_TYPES = [
+        'pkcs11', 'aws-cloudhsm', 'azure-keyvault', 'google-kms', 'openbao',
+        'sc-hsm-cloud',
+    ]
     
     # Valid statuses
-    VALID_STATUSES = ['connected', 'disconnected', 'error', 'unknown']
+    VALID_STATUSES = ['connected', 'disconnected', 'error', 'unknown', 'offline']
     
-    def to_dict(self, include_config=False):
+    def to_dict(self, include_config=False, include_custodian_tokens=False):
         """
         Convert to dict for API response
-        Config is excluded by default for security
+        Config is excluded by default for security.
+        Custodian connect tokens / ram_client_url only on detail when
+        ``include_custodian_tokens`` is True (ceremony view).
         """
         result = {
             'id': self.id,
@@ -94,6 +103,12 @@ class HsmProvider(db.Model if db else object):
             'updated_at': utc_isoformat(self.updated_at),
             'key_count': self.keys.count() if self.keys else 0
         }
+
+        if self.type == 'sc-hsm-cloud':
+            result['custodians'] = [
+                c.to_dict(include_token=include_custodian_tokens)
+                for c in (self.custodians.all() if self.custodians else [])
+            ]
         
         if include_config:
             # Parse config but mask sensitive fields
@@ -116,6 +131,7 @@ class HsmProvider(db.Model if db else object):
                     'azure-keyvault': 'azure',
                     'google-kms': 'gcp',
                     'openbao': 'openbao',
+                    'sc-hsm-cloud': 'schsm',
                 }.get(self.type)
                 if type_prefix:
                     # Per-type field aliases (config_key -> form_field)
@@ -151,6 +167,13 @@ class HsmProvider(db.Model if db else object):
                             'mount_path': 'openbao_mount_path',
                             'namespace': 'openbao_namespace',
                             'tls_skip_verify': 'openbao_tls_skip_verify',
+                        },
+                        'sc-hsm-cloud': {
+                            'token_label': 'schsm_token_label',
+                            'threshold_n': 'schsm_threshold_n',
+                            'total_m': 'schsm_total_m',
+                            'module_path': 'schsm_module_path',
+                            'wrapped_root': 'schsm_wrapped_root',
                         },
                     }.get(self.type, {})
                     for cfg_key, form_field in aliases.items():
@@ -297,3 +320,75 @@ class HsmKey(db.Model if db else object):
     
     def __repr__(self):
         return f'<HsmKey {self.label} ({self.algorithm})>'
+
+
+class HsmCustodian(db.Model if db else object):
+    """One keyholder for an ``sc-hsm-cloud`` provider.
+
+    Holds the per-custodian ceremony connect token (encrypted) and share index.
+    Share bytes themselves are never stored.
+    """
+
+    __tablename__ = 'hsm_custodians'
+
+    id = db.Column(db.Integer, primary_key=True)
+    provider_id = db.Column(
+        db.Integer,
+        db.ForeignKey('hsm_providers.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True, index=True)
+    display_name = db.Column(db.String(255), nullable=False, default='')
+    share_index = db.Column(db.Integer, nullable=False)
+    # Encrypted at rest via encrypt_if_needed
+    connect_token_enc = db.Column(db.Text, nullable=False)
+    auth_public_key = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=utc_now)
+
+    __table_args__ = (
+        db.UniqueConstraint('provider_id', 'share_index', name='uq_hsm_custodian_share'),
+    )
+
+    provider = db.relationship(
+        'HsmProvider',
+        backref=db.backref('custodians', lazy='dynamic', cascade='all, delete-orphan'),
+    )
+    user = db.relationship('User', foreign_keys=[user_id])
+
+    def get_connect_token(self) -> str:
+        return decrypt_if_needed(self.connect_token_enc) if self.connect_token_enc else ''
+
+    def set_connect_token(self, token: str) -> None:
+        self.connect_token_enc = encrypt_if_needed(token) if token else ''
+
+    def ram_client_url(self) -> Optional[str]:
+        """Public HTTPS URL ram-client should POST to during a ceremony.
+
+        Imported here because utils.public_endpoints imports models at load.
+        """
+        token = self.get_connect_token()
+        if not token:
+            return None
+        from utils.public_endpoints import get_ram_public_origin
+        origin = get_ram_public_origin()['origin'].rstrip('/')
+        return f'{origin}/hsm/ram/{token}'
+
+    def to_dict(self, include_token: bool = False):
+        result = {
+            'id': self.id,
+            'provider_id': self.provider_id,
+            'user_id': self.user_id,
+            'display_name': self.display_name,
+            'share_index': self.share_index,
+            'has_auth_public_key': bool(self.auth_public_key),
+            'created_at': utc_isoformat(self.created_at),
+        }
+        if include_token:
+            # Ceremony detail only — never in list responses or audit rows.
+            result['ram_client_url'] = self.ram_client_url()
+            result['connect_token_set'] = bool(self.connect_token_enc)
+        return result
+
+    def __repr__(self):
+        return f'<HsmCustodian provider={self.provider_id} share={self.share_index}>'

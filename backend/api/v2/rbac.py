@@ -43,7 +43,7 @@ AVAILABLE_PERMISSIONS = [
     # Trust Store 
     'read:truststore', 'write:truststore', 'delete:truststore',
     # HSM 
-    'read:hsm', 'write:hsm', 'delete:hsm',
+    'read:hsm', 'write:hsm', 'delete:hsm', 'contribute:hsm',
     # SSO 
     'read:sso', 'write:sso', 'delete:sso',
     # Templates

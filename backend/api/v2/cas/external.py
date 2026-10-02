@@ -202,7 +202,8 @@ def renew_ca_csr(ca_id):
         return error_response('CA not found', 404)
     if not ca.has_private_key:
         return error_response('CA has no private key', 400)
-    if ca.offline:
+    from services.hsm.signing_window import operator_offline_blocks
+    if operator_offline_blocks(ca):
         return error_response('CA is offline; restore it before renewing', 409)
     if ca.revoked:
         return error_response('CA is revoked; a revoked CA is not renewed', 409)

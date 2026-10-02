@@ -16,6 +16,7 @@ from models import CA, db
 from models.hsm import HsmKey
 from services.audit_service import AuditService
 from services.trust_store import TrustStoreService
+from services.hsm.signing_window import operator_offline_blocks
 from utils.datetime_utils import to_naive_utc, utc_isoformat, utc_now
 from utils.serial_format import serial_to_int
 from .helpers import save_ca_files, save_ca_key_file
@@ -232,6 +233,11 @@ class CACreationMixin:
             # Load parent CA signing key
             if not parent_ca.has_private_key:
                 raise ValueError("Parent CA has no private key")
+            if operator_offline_blocks(parent_ca):
+                raise ValueError(
+                    f"Parent CA '{parent_ca.descr}' is offline and no "
+                    "SmartCard-HSM signing window is open"
+                )
             issuer_private_key = get_ca_signing_key(parent_ca)
 
             # Increment parent CA serial

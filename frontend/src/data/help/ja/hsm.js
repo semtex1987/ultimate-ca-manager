@@ -2,7 +2,7 @@ export default {
   helpContent: {
     title: 'ハードウェアセキュリティモジュール',
     subtitle: '外部鍵ストレージ',
-    overview: 'HSMと統合して秘密鍵を安全に保管します。PKCS#11、AWS CloudHSM、Azure Key Vault、Google Cloud KMS、OpenBao/Vault Transitをサポートしています。',
+    overview: 'HSMと統合して秘密鍵を安全に保管します。PKCS#11、AWS CloudHSM、Azure Key Vault、Google Cloud KMS、OpenBao/Vault Transit、SmartCard-HSM（リモート）をサポートしています。',
     sections: [
       {
         title: '対応プロバイダー',
@@ -12,6 +12,7 @@ export default {
           { term: 'Azure Key Vault', description: 'Microsoft Azureマネージドキーストレージ' },
           { term: 'Google KMS', description: 'Google Cloud鍵管理サービス' },
           { term: 'OpenBao / Vault Transit', description: 'OpenBaoまたはVault Transit Secrets Engineによるサービスとしての鍵管理' },
+          { term: 'SmartCard-HSM（リモート）', description: 'USB SmartCard-HSM トークン上のしきい値 DKEK シェアによるオフラインルート。ram-client が RAMOverHTTP で署名ウィンドウに参加' },
         ]
       },
       {
@@ -32,6 +33,24 @@ export default {
           { label: 'エクスポート制限', text: 'HSM-CA では PKCS#12、JKS、鍵単独エクスポートは無効(公開証明書 / チェーンのみエクスポート可)' },
           { label: 'CRL と OCSP', text: '両方とも HSM-CA で透過的に動作(HSM 経由で署名)' },
           { label: 'マイグレーション', text: '既存のローカル CA は作成後に HSM へ移動できません, 作成時に選択' },
+        ]
+      },
+
+      {
+        title: 'SmartCard-HSM オフラインルート',
+        content: 'プロバイダ種別 sc-hsm-cloud は USB トークン上の n-of-m DKEK シェアでオフラインルートを保護します。UCM はラップされたルート blob とセレモニー URL のみを保存し、シェアバイトは保存しません。',
+        items: [
+          { label: 'しきい値 n / 総数 m', text: '接続が必要なシェア数とトークンを持つカストディアン数を設定' },
+          { label: 'カストディアン割り当て', text: '各シェア索引を contribute:hsm を持つ UCM ユーザーに対応付け。write:hsm が名簿を管理' },
+          { label: '署名ウィンドウ', text: 'オペレータがルート操作専用のウィンドウを開く。ca.offline が設定されている間、プロトコル（ACME、SCEP、EST、WSTEP）は拒否されたまま' },
+          { label: 'ram-client', text: '各カストディアンは自分専用のワンショットコマンドと状態（待機中 / 接続済み / 寄与済み）のみを見る' },
+          { label: 'トークンを確認', text: 'キードメインの状態とシェアファイル CF01 の有無を読む。SW=6A82 はカードが応答し、シェアファイルがまだ無いことを意味する' },
+          { label: 'デバイスを再初期化', text: 'CardContact の Initialize device と同じ。すべての鍵とファイルを消去し、方式を一つ設定する。DKEK シェア（このセレモニーで使う）、ランダム DKEK、DKEK なし、キードメイン。SO-PIN はカード上の現在の初期化コード。DELETE と入力。シェアは書かない' },
+          { label: 'トークンを準備', text: 'すでにキーシェアドメインがあるカードのシェアファイルとドメインを削除する。DELETE と入力' },
+          { label: 'ルート鍵を作成', text: '初回セレモニー。全カストディアンが接続している必要がある。鍵を生成し、各トークンにシェアを書き、ラップしたルートを保存する。DELETE と入力' },
+          { label: 'アセンブリデバイス', text: '次回以降のウィンドウ。既にあるシェアを読む。出席しているしきい値の保持者なら誰でも組み立てできる。前回のトークンは不要。n-of-n はトークンが欠けると進めない' },
+          { label: '消去前の CRL', text: '最新変更後に CRL が再生成されるまで消去はブロック。ウィンドウを閉じる前に消去確認が必要' },
+          { label: 'OCSP レスポンダ', text: '委任レスポンダが次回セレモニー前に期限切れになる場合、閉じるには明示的な確認が必要（黙って閉じない）' },
         ]
       },
 
@@ -105,6 +124,21 @@ OpenBaoまたはHashiCorp Vault Transit Secrets Engine。鍵はTransit APIを介
 - AES-256-GCM（対称）
 
 > 💡 OpenBaoはHashiCorp Vaultのコミュニティフォークです。UCMは両方で動作します。
+
+
+### SmartCard-HSM（リモート）
+USB SmartCard-HSM トークンによるオフラインルート（\`sc-hsm-cloud\`）。AWS CloudHSM とは別です。
+
+- **しきい値 n / 総数 m**: 接続が必要なシェア数とカストディアン数
+- **カストディアン**: 各シェア索引を UCM ユーザーに対応（\`contribute:hsm\` が参加、\`write:hsm\` が名簿管理）
+- **署名ウィンドウ**: ルート操作のためのウィンドウ。プロトコルは拒否されたまま。\`ca.offline\` は維持
+- **ram-client**: 各カストディアンは自分だけに表示されるワンショットコマンドを実行。状態は待機中 / 接続済み / 寄与済み
+- **準備完了**: DKEK シェア用に初期化済み、空のドメイン、ファイル \`CF01\` なし。**トークンを確認**がこれを読む。\`SW=6A82\` はシェアファイルがまだ無い
+- **デバイスを再初期化**: CardContact の Initialize device と同じ。鍵とファイルを消去し方式を一つ設定（UCM では DKEK シェア）。SO-PIN は現在の初期化コード。\`DELETE\` と入力。\`SW=6982\` は SO-PIN 不一致、\`SW=6A80\` は初期化データの拒否、\`SW=6D00\` はキーシェアドメインが無い
+- **ルート鍵を作成**: 初回セレモニー。\`m\` 個すべてのトークンが接続していること。最初のシェアを書く。**アセンブリデバイス**は既にあるシェアだけを読む。次のウィンドウでは出席しているしきい値で足りる。n-of-n は全員が必要
+- **アセンブリデバイス**: 接続済みトークンの 1 つがルート鍵を再構築。UCM は平文鍵もシェアバイトも見ない
+- **消去前の CRL**: 最新変更後の CRL 再生成まで消去ブロック。閉じる前に消去確認が必要
+- **OCSP 警告**: 委任レスポンダが次回セレモニー前に期限切れになる場合、明示的な確認が必要
 
 ## プロバイダーの管理
 

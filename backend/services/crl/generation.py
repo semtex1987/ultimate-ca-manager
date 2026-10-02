@@ -13,6 +13,8 @@ from models.crl import CRLMetadata
 from utils.datetime_utils import utc_now
 from services.cert.serial_resolution import resolve_record_serial
 from utils.x509_aki import authority_key_identifier_from_issuer
+from services.hsm.ceremony_service import on_crl_published
+from services.hsm.signing_window import operator_offline_blocks
 from ._constants import REASON_MAP
 from .query import CRLQueryMixin, _not_expired
 
@@ -23,12 +25,13 @@ from utils.signing_hash import signing_hash_for
 
 
 def _refuse_offline_ca(ca) -> None:
-    """An offline CA signs nothing here, CRL included.
+    """An offline CA signs nothing here, CRL included — unless a signing window is open.
 
     Its CRL is signed next to the key and uploaded (#302). Every other
     signing path refuses already; these two served the CDP without asking.
+    Operator root actions use :func:`signing_window_open` as the single exception.
     """
-    if ca.offline:
+    if operator_offline_blocks(ca):
         raise ValueError(
             f"CA {ca.descr} is offline - its CRL is signed externally and uploaded"
         )
@@ -303,6 +306,8 @@ class CRLGenerationMixin:
             meta={'actor': username},
         )
 
+        on_crl_published(ca)
+
         return crl_metadata
 
     @staticmethod
@@ -445,5 +450,7 @@ class CRLGenerationMixin:
             f"Generated delta CRL #{crl_number} for CA {ca.descr} "
             f"(base #{base_crl.crl_number}, {entries} entries)"
         )
+
+        on_crl_published(ca)
 
         return crl_metadata

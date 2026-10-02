@@ -2,7 +2,7 @@ export default {
   helpContent: {
     title: '硬件安全模块',
     subtitle: '外部密钥存储',
-    overview: '与硬件安全模块集成实现安全的私钥存储。支持 PKCS#11、AWS CloudHSM、Azure Key Vault、Google Cloud KMS 和 OpenBao/Vault Transit。',
+    overview: '与硬件安全模块集成实现安全的私钥存储。支持 PKCS#11、AWS CloudHSM、Azure Key Vault、Google Cloud KMS、OpenBao/Vault Transit 和 SmartCard-HSM（远程）。',
     sections: [
       {
         title: '支持的提供商',
@@ -12,6 +12,7 @@ export default {
           { term: 'Azure Key Vault', description: 'Microsoft Azure 托管密钥存储' },
           { term: 'Google KMS', description: 'Google Cloud 密钥管理服务' },
           { term: 'OpenBao / Vault Transit', description: 'OpenBao 或 Vault Transit 密钥引擎，提供密钥管理即服务' },
+          { term: 'SmartCard-HSM（远程）', description: '基于 USB SmartCard-HSM 令牌上门限 DKEK 份额的离线根；ram-client 通过 RAMOverHTTP 加入签名窗口' },
         ]
       },
       {
@@ -32,6 +33,24 @@ export default {
           { label: '导出限制', text: 'HSM-CA 禁用 PKCS#12、JKS 和仅密钥导出(只能导出公共证书 / 链)' },
           { label: 'CRL 和 OCSP', text: '两者都与 HSM-CA 透明工作(通过 HSM 签名)' },
           { label: '迁移', text: '现有本地 CA 在创建后无法移至 HSM, 在创建时选择' },
+        ]
+      },
+
+      {
+        title: 'SmartCard-HSM 离线根',
+        content: '提供商类型 sc-hsm-cloud 用 USB 令牌上的 n-of-m DKEK 份额保护离线根。UCM 仅存储封装的根 blob 和仪式 URL — 从不存储份额字节。',
+        items: [
+          { label: '门限 n / 总数 m', text: '配置需要连接的份额数以及持有令牌的保管人数' },
+          { label: '保管人分配', text: '将每个份额索引映射到具有 contribute:hsm 的 UCM 用户；write:hsm 管理名单' },
+          { label: '签名窗口', text: '操作员仅为根操作打开窗口。在 ca.offline 保持设置期间，协议（ACME、SCEP、EST、WSTEP）仍被拒绝' },
+          { label: 'ram-client', text: '每位保管人仅看到自己的一次性命令和状态：等待中、已连接或已贡献' },
+          { label: '检查令牌', text: '读取密钥域状态以及份额文件 CF01 是否存在。SW=6A82 表示卡已应答，份额文件尚不存在' },
+          { label: '重新初始化设备', text: '与 CardContact 的 Initialize device 相同。清除所有密钥和文件，并设置一种方案：DKEK 份额（本仪式使用）、随机 DKEK、无 DKEK 或密钥域。SO-PIN 是卡上当前的初始化码。输入 DELETE。不会写入份额' },
+          { label: '准备令牌', text: '在已有密钥份额域的卡上删除份额文件和密钥域。输入 DELETE' },
+          { label: '创建根密钥', text: '首次仪式。所有保管人必须已连接。生成密钥，向每个令牌写入一份份额，并保存封装的根。输入 DELETE' },
+          { label: '组装设备', text: '后续窗口。读取令牌上已有的份额。在场的任意门限持有者都可以组装；上次的令牌不必在场。n-of-n 在缺少令牌时无法继续' },
+          { label: '擦除前的 CRL', text: '在最新更改后重新生成 CRL 之前阻止擦除；关闭窗口前必须确认擦除' },
+          { label: 'OCSP 响应器', text: '若委托响应器在下次仪式前过期，关闭需要明确确认 — 不能默默关闭' },
         ]
       },
 
@@ -105,6 +124,21 @@ OpenBao 或 HashiCorp Vault Transit Secrets Engine。密钥通过 Transit API �
 - AES-256-GCM（对称）
 
 > 💡 OpenBao 是 HashiCorp Vault 的社区分支。UCM 两者都支持。
+
+
+### SmartCard-HSM（远程）
+由 USB SmartCard-HSM 令牌支持的离线根（\`sc-hsm-cloud\`）。与 AWS CloudHSM 不同。
+
+- **门限 n / 总数 m**：需要连接的份额数与持有令牌的保管人数
+- **保管人**：每个份额索引对应一名 UCM 用户（\`contribute:hsm\` 加入；\`write:hsm\` 管理名单）
+- **签名窗口**：操作员为根操作打开窗口。协议仍被拒绝；\`ca.offline\` 保持设置
+- **ram-client**：每位保管人运行仅向其显示的一次性命令；状态为等待中、已连接或已贡献
+- **就绪**：已按 DKEK 份额初始化，密钥域为空，没有文件 \`CF01\`。**检查令牌**读取该状态。\`SW=6A82\` 表示份额文件尚不存在
+- **重新初始化设备**：与 CardContact 的 Initialize device 相同。清除密钥和文件并设置一种方案（UCM 使用 DKEK 份额）。SO-PIN 是当前初始化码。输入 \`DELETE\`。\`SW=6982\` 为 SO-PIN 不符，\`SW=6A80\` 为初始化数据被拒绝，\`SW=6D00\` 表示没有密钥份额域
+- **创建根密钥**：首次仪式，全部 \`m\` 个令牌已连接。写入第一份份额。**组装设备**只读取令牌上已有的份额。下次窗口中，在场的任意门限即可组装；n-of-n 需要全部令牌
+- **组装设备**：一个已连接令牌重建根密钥；UCM 从不看到明文密钥或份额字节
+- **擦除前的 CRL**：重新生成 CRL 之前阻止擦除；关闭前必须确认
+- **OCSP 警告**：若委托响应器在下次仪式前过期，关闭需要明确确认
 
 ## 管理提供商
 

@@ -14,8 +14,9 @@ architecture, configuration, DNS preflight, and security constraints.
 | **Admin** | `https://admin.ucm.example.com:8443` | GUI, `/api/*`, WebSocket, CORS, redirect target for IP/alias |
 | **Protocol** | `http://pki.ucm.example.com:8080` | CDP/OCSP/AIA base URL embedded in certificates (HTTP avoids TLS loops) |
 | **ACME** | `https://acme.ucm.example.com:8443` | Directory URLs when split from admin (`acme_public_vhost`) |
+| **RAM** | `https://ucm-api.example.com` | SmartCard-HSM `ram-client` (`UCM_RAM_PUBLIC_URL` or `ram_public_url`). Own listener, port `RAM_PORT` (8444). Not path-routed on the admin vhost. |
 
-Single gunicorn listener; production uses a reverse proxy for SNI/TLS per vhost.
+The admin, protocol, and ACME roles share one gunicorn listener. The RAM bridge is a separate process. Production uses a reverse proxy for SNI/TLS per vhost. The admin vhost must not proxy `/hsm/ram/`: that POST hits the web UI and returns HTTP 405.
 
 ### Code map
 
@@ -45,6 +46,7 @@ Explicit ports in DB are preserved as-is.
 | `protocol_base_url` | HTTP | Protocol base (empty → admin host + protocol port) |
 | `acme_public_vhost` | host only | ACME hostname in directory URLs |
 | `acme_public_port` | 1–65535 | Port in ACME URLs |
+| `ram_public_url` | HTTPS | ram-client origin. Empty means admin host plus `RAM_PORT`. Ignored while `UCM_RAM_PUBLIC_URL` is set. |
 
 Save rules: valid FQDN, no path/query; `metadata.google.internal` and similar blocked;
 wildcard rejected for `acme_public_vhost` (TLS SAN only).
@@ -56,6 +58,8 @@ wildcard rejected for `acme_public_vhost` (TLS SAN only).
 | `FQDN` / `UCM_FQDN` | Fallback admin host when `base_url` empty; GUI hint when env-locked |
 | `HTTPS_PORT` | Default admin/ACME port when URL has no `:port` |
 | `HTTP_PROTOCOL_PORT` | Default protocol HTTP port |
+| `UCM_RAM_PUBLIC_URL` | ram-client origin when a reverse proxy publishes a dedicated hostname. Unset: advertise admin host plus `RAM_PORT`. |
+| `RAM_PORT` | Port the bridge binds (default `8444`). Not appended when a public RAM origin is set. |
 | `CORS_EXTRA_ORIGINS` | Comma-separated extra CORS origins |
 | `UCM_CORPORATE_DNS_SERVERS` | Internal resolvers for preflight **DNS (interne)** (comma-separated IPs) |
 | `UCM_BEHIND_PROXY` / `UCM_TRUSTED_PROXY_HOPS` | Enable ProxyFix for `X-Forwarded-*` |

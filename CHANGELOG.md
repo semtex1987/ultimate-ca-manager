@@ -7,6 +7,11 @@ Starting with v2.48, UCM uses Major.Build versioning (e.g., 2.48, 2.49). Earlier
 
 ---
 
+## [Unreleased]
+
+### Added
+- SmartCard-HSM remote ceremony: n-of-m DKEK shares stay on custodian tokens, an assembly card holds the root key only during a signing window, and custodians join with ram-client over a dedicated RAM origin.
+
 ## [2.235] - 2026-09-26
 
 ### Fixed

@@ -62,7 +62,7 @@ const PERMISSION_CATEGORIES = {
   },
   hsm: {
     labelKey: 'rbac.categories.hsmManagement',
-    permissions: ['read:hsm', 'write:hsm', 'delete:hsm']
+    permissions: ['read:hsm', 'write:hsm', 'delete:hsm', 'contribute:hsm']
   },
   sso: {
     labelKey: 'rbac.categories.singleSignOn',

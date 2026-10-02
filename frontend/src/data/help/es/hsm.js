@@ -2,7 +2,7 @@ export default {
   helpContent: {
     title: 'Módulos de Seguridad de Hardware',
     subtitle: 'Almacenamiento externo de claves',
-    overview: 'Integre con Módulos de Seguridad de Hardware para el almacenamiento seguro de claves privadas. Soporte para PKCS#11, AWS CloudHSM, Azure Key Vault, Google Cloud KMS y OpenBao/Vault Transit.',
+    overview: 'Integre con Módulos de Seguridad de Hardware para el almacenamiento seguro de claves privadas. Soporte para PKCS#11, AWS CloudHSM, Azure Key Vault, Google Cloud KMS, OpenBao/Vault Transit y SmartCard-HSM (remoto).',
     sections: [
       {
         title: 'Proveedores compatibles',
@@ -12,6 +12,7 @@ export default {
           { term: 'Azure Key Vault', description: 'Almacenamiento de claves gestionado de Microsoft Azure' },
           { term: 'Google KMS', description: 'Servicio de gestión de claves de Google Cloud' },
           { term: 'OpenBao / Vault Transit', description: 'Motor de secretos Transit de OpenBao o Vault para gestión de claves como servicio' },
+          { term: 'SmartCard-HSM (remoto)', description: 'Raíz sin conexión con participaciones DKEK de umbral en tokens USB SmartCard-HSM; ram-client se une a una ventana de firma por RAMOverHTTP' },
         ]
       },
       {
@@ -32,6 +33,24 @@ export default {
           { label: 'Restricciones de exportación', text: 'PKCS#12, JKS y exportaciones de solo clave están deshabilitadas para CA HSM (solo el certificado público / cadena pueden exportarse)' },
           { label: 'CRL y OCSP', text: 'Ambos funcionan de forma transparente con CA HSM (firmados vía HSM)' },
           { label: 'Migración', text: 'Las CA locales existentes no pueden moverse a un HSM tras la creación, elegir en la creación' },
+        ]
+      },
+
+      {
+        title: 'Raíz offline SmartCard-HSM',
+        content: 'El tipo de proveedor sc-hsm-cloud respalda una raíz offline con participaciones DKEK n de m en tokens USB. UCM solo almacena el blob envuelto y las URL de ceremonia — nunca bytes de participación.',
+        items: [
+          { label: 'Umbral n / total m', text: 'Configure cuántas participaciones deben conectarse y cuántos custodios tienen tokens' },
+          { label: 'Asignación de custodios', text: 'Asigne cada índice de participación a un usuario UCM con contribute:hsm; write:hsm gestiona la lista' },
+          { label: 'Ventana de firma', text: 'Un operador abre una ventana solo para acciones de raíz. Los protocolos (ACME, SCEP, EST, WSTEP) siguen denegados mientras ca.offline esté activo' },
+          { label: 'ram-client', text: 'Cada custodio ve solo su propio comando de un solo uso y el estado: en espera, conectado o aportado' },
+          { label: 'Comprobar token', text: 'Lee el estado del dominio de claves y si existe el archivo de participación CF01. SW=6A82 significa que la tarjeta respondió y aún no tiene ese archivo' },
+          { label: 'Reinicializar dispositivo', text: 'Igual que Initialize device de CardContact. Borra todas las claves y archivos y fija un esquema: participaciones DKEK (úselo aquí), DKEK aleatorio, sin DKEK o dominios de claves. El SO-PIN es el código de inicialización actual. Escriba DELETE. No escribe participaciones' },
+          { label: 'Preparar token', text: 'Borra el archivo de participación y el dominio en una tarjeta que ya tiene dominio de participaciones. Escriba DELETE' },
+          { label: 'Crear clave raíz', text: 'Primera ceremonia. Todos los custodios deben estar conectados. Genera la clave, escribe una participación en cada token y guarda la raíz envuelta. Escriba DELETE' },
+          { label: 'Dispositivo de ensamblaje', text: 'Ventana posterior. Lee participaciones que ya están en los tokens. Cualquier umbral de presentes puede ensamblar; el token de la vez anterior no tiene que estar. n de n no puede seguir si falta un token' },
+          { label: 'CRL antes del borrado', text: 'El borrado se bloquea hasta regenerar la CRL tras el último cambio; el borrado debe confirmarse antes de cerrar' },
+          { label: 'Respondedor OCSP', text: 'Si el respondedor delegado caduca antes de la próxima ceremonia, el cierre requiere un reconocimiento explícito — no un cierre silencioso' },
         ]
       },
 
@@ -105,6 +124,21 @@ Tipos de claves soportados:
 - AES-256-GCM (simétrico)
 
 > 💡 OpenBao es un fork comunitario de HashiCorp Vault. UCM funciona con ambos.
+
+
+### SmartCard-HSM (remoto)
+Raíz offline respaldada por tokens USB SmartCard-HSM (\`sc-hsm-cloud\`). Distinto de AWS CloudHSM.
+
+- **Umbral n / total m**: Cuántas participaciones deben conectarse y cuántos custodios tienen tokens
+- **Custodios**: Cada índice de participación se asigna a un usuario UCM (\`contribute:hsm\` se une; \`write:hsm\` gestiona la lista)
+- **Ventana de firma**: El operador abre una ventana para acciones de raíz. Los protocolos siguen denegados; \`ca.offline\` permanece
+- **ram-client**: Cada custodio ejecuta un comando de un solo uso mostrado solo a él; estado en espera, conectado o aportado
+- **Listo**: Inicializado para participaciones DKEK, dominio vacío, sin archivo \`CF01\`. **Comprobar token** lo lee. \`SW=6A82\` significa que aún no hay archivo de participación
+- **Reinicializar dispositivo**: Igual que Initialize device de CardContact. Borra claves y archivos y fija un esquema (para UCM: participaciones DKEK). El SO-PIN es el código actual. Escriba \`DELETE\`. \`SW=6982\` es un SO-PIN incorrecto; \`SW=6A80\` datos rechazados; \`SW=6D00\` indica que no hay dominio de participaciones
+- **Crear clave raíz**: Primera ceremonia, los \`m\` tokens conectados. Escribe la primera participación. **Dispositivo de ensamblaje** solo lee participaciones ya presentes. En la ventana siguiente basta cualquier umbral presente; n de n exige todos
+- **Dispositivo de ensamblaje**: Un token conectado reconstruye la clave raíz; UCM nunca ve la clave en claro ni bytes de participación
+- **CRL antes del borrado**: El borrado se bloquea hasta regenerar la CRL; debe confirmarse antes de cerrar
+- **Aviso OCSP**: Si el respondedor delegado caduca antes de la próxima ceremonia, el cierre requiere reconocimiento explícito
 
 ## Gestión de proveedores
 

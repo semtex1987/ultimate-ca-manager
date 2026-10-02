@@ -853,8 +853,9 @@ def sign_csr(csr_id):
     if not ca.crt or not ca.has_private_key:
         return error_response('CA is not valid for signing', 400)
 
-    # Check offline status
-    if ca.offline:
+    # Check offline status (signing window is the sole operator exception)
+    from services.hsm.signing_window import operator_offline_blocks
+    if operator_offline_blocks(ca):
         return error_response(
             f"CA is offline: {ca.offline_reason or 'no reason provided'}",
             400

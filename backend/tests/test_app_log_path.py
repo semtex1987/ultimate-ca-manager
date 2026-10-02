@@ -72,6 +72,25 @@ class TestInstallFileHandler:
             handler.flush()
         assert 'written to the resolved file' in target.read_text()
 
+    def test_bridge_follower_uses_the_system_log_format(self, not_docker, monkeypatch, tmp_path):
+        from services.log_reader import _RECORD
+
+        target = tmp_path / 'ucm.log'
+        monkeypatch.setenv('UCM_LOG_FILE', str(target))
+        logger = self._logger('ucm.ram_bridge')
+        formatter = logging.Formatter(
+            '%(asctime)s [%(name)s] %(levelname)s %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+        )
+        assert app_log.install_follower_handler(logger, formatter) == target
+        logger.info('custodian 4 card answered; share EF CF01 is absent (SW=6A82)')
+        for handler in logger.handlers:
+            handler.flush()
+        line = target.read_text().strip().splitlines()[-1]
+        assert _RECORD.match(line)
+        assert 'ucm.ram_bridge' in line
+        assert 'SW=6A82' in line
+
     def test_falls_back_when_the_preferred_path_is_unusable(self, not_docker, monkeypatch, tmp_path):
         blocked = tmp_path / 'blocked'
         blocked.write_text('a file where a directory would have to be')

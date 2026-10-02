@@ -9,6 +9,7 @@ from typing import List
 
 from models import CA, db
 from .helpers import get_ca_cert_pem
+from services.hsm.ceremony_service import on_operator_change
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,7 @@ class CAOperationsMixin:
         # Each warning comes with a code the UI can translate
         warnings = []
         warning_codes = []
+        on_operator_change(parent)
         if parent.cdp_enabled:
             from services.crl_service import CRLService
             try:

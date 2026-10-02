@@ -96,6 +96,7 @@ SUDOERS
         # Enable ucm-watcher for restart/update handling
         # Units are installed to /lib/systemd/system/ by the package
         systemctl daemon-reload
+        systemctl enable ucm-ram-bridge.service 2>/dev/null || true
         systemctl enable ucm-watcher.path 2>/dev/null || true
         systemctl start ucm-watcher.path 2>/dev/null || true
         

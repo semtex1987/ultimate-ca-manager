@@ -2,7 +2,7 @@ export default {
   helpContent: {
     title: 'Moduli di sicurezza hardware',
     subtitle: 'Archiviazione esterna delle chiavi',
-    overview: 'Integrazione con moduli di sicurezza hardware per l\'archiviazione sicura delle chiavi private. Supporto per PKCS#11, AWS CloudHSM, Azure Key Vault, Google Cloud KMS e OpenBao/Vault Transit.',
+    overview: 'Integrazione con moduli di sicurezza hardware per l\'archiviazione sicura delle chiavi private. Supporto per PKCS#11, AWS CloudHSM, Azure Key Vault, Google Cloud KMS, OpenBao/Vault Transit e SmartCard-HSM (remoto).',
     sections: [
       {
         title: 'Provider supportati',
@@ -12,6 +12,7 @@ export default {
           { term: 'Azure Key Vault', description: 'Archiviazione chiavi gestita di Microsoft Azure' },
           { term: 'Google KMS', description: 'Servizio di gestione chiavi di Google Cloud' },
           { term: 'OpenBao / Vault Transit', description: 'OpenBao o Vault Transit Secrets Engine per la gestione delle chiavi come servizio' },
+          { term: 'SmartCard-HSM (remoto)', description: 'Root offline con quote DKEK a soglia su token USB SmartCard-HSM; ram-client si unisce a una finestra di firma tramite RAMOverHTTP' },
         ]
       },
       {
@@ -32,6 +33,24 @@ export default {
           { label: 'Restrizioni di export', text: 'PKCS#12, JKS ed export di sola chiave sono disabilitati per le CA HSM (solo il certificato pubblico / la chain possono essere esportati)' },
           { label: 'CRL & OCSP', text: 'Entrambi funzionano in modo trasparente con le CA HSM (firmati via HSM)' },
           { label: 'Migrazione', text: 'Le CA locali esistenti non possono essere spostate in un HSM dopo la creazione, scegliere alla creazione' },
+        ]
+      },
+
+      {
+        title: 'Root offline SmartCard-HSM',
+        content: 'Il tipo di provider sc-hsm-cloud protegge una root offline con quote DKEK n di m su token USB. UCM memorizza solo il blob wrappato e gli URL di cerimonia — mai i byte delle quote.',
+        items: [
+          { label: 'Soglia n / totale m', text: 'Configura quante quote devono collegarsi e quanti custodi detengono token' },
+          { label: 'Assegnazione custodi', text: 'Associa ogni indice di quota a un utente UCM con contribute:hsm; write:hsm gestisce l\'elenco' },
+          { label: 'Finestra di firma', text: 'Un operatore apre una finestra solo per azioni root. I protocolli (ACME, SCEP, EST, WSTEP) restano rifiutati finché ca.offline è impostato' },
+          { label: 'ram-client', text: 'Ogni custode vede solo il proprio comando monouso e lo stato: in attesa, collegato o contribuito' },
+          { label: 'Controlla token', text: 'Legge lo stato del dominio chiavi e se esiste il file quota CF01. SW=6A82 significa che la carta ha risposto e il file non c’è ancora' },
+          { label: 'Reinizializza dispositivo', text: 'Come Initialize device di CardContact. Cancella chiavi e file e imposta uno schema: quote DKEK (da usare qui), DKEK casuale, nessun DKEK o domini chiave. Il SO-PIN è il codice di inizializzazione attuale. Digitare DELETE. Non scrive quote' },
+          { label: 'Prepara token', text: 'Elimina file quota e dominio su una carta che ha già un dominio quote. Digitare DELETE' },
+          { label: 'Crea chiave root', text: 'Prima cerimonia. Tutti i custodi devono essere collegati. Genera la chiave, scrive una quota su ogni token e salva la root wrappata. Digitare DELETE' },
+          { label: 'Dispositivo di assemblaggio', text: 'Finestra successiva. Legge quote già presenti. Qualsiasi soglia di presenti può assemblare; il token usato l’ultima volta non deve esserci. n di n si blocca se manca un token' },
+          { label: 'CRL prima della cancellazione', text: 'La cancellazione è bloccata finché la CRL non è rigenerata dopo l\'ultima modifica; la cancellazione deve essere confermata prima della chiusura' },
+          { label: 'Responder OCSP', text: 'Se il responder delegato scade prima della prossima cerimonia, la chiusura richiede un riconoscimento esplicito — non una chiusura silenziosa' },
         ]
       },
 
@@ -141,6 +160,20 @@ Quando crei una CA, seleziona un provider HSM e una chiave invece di generare un
 > ⚠ Le chiavi generate su un HSM non possono essere esportate. Se perdi l'accesso all'HSM, perdi le chiavi.
 
 > 💡 Usa SoftHSM per lo sviluppo e i test prima di implementare HSM fisici.
+
+### SmartCard-HSM (remoto)
+Root offline basata su token USB SmartCard-HSM (\`sc-hsm-cloud\`). Distinto da AWS CloudHSM.
+
+- **Soglia n / totale m**: Quante quote devono collegarsi e quanti custodi detengono token
+- **Custodi**: Ogni indice di quota è mappato a un utente UCM (\`contribute:hsm\` si unisce; \`write:hsm\` gestisce l'elenco)
+- **Finestra di firma**: L'operatore apre una finestra per azioni root. I protocolli restano rifiutati; \`ca.offline\` resta impostato
+- **ram-client**: Ogni custode esegue un comando monouso mostrato solo a lui; stato in attesa, collegato o contribuito
+- **Pronto**: Inizializzato per quote DKEK, dominio vuoto, nessun file \`CF01\`. **Controlla token** lo legge. \`SW=6A82\` significa che il file quota non c’è ancora
+- **Reinizializza dispositivo**: Come Initialize device di CardContact. Cancella chiavi e file e imposta uno schema (per UCM: quote DKEK). Il SO-PIN è il codice attuale. Digitare \`DELETE\`. \`SW=6982\` SO-PIN errato; \`SW=6A80\` dati rifiutati; \`SW=6D00\` nessun dominio quote
+- **Crea chiave root**: Prima cerimonia, tutti i token \`m\` collegati. Scrive la prima quota. **Dispositivo di assemblaggio** legge solo quote già presenti. Nella finestra successiva basta qualsiasi soglia presente; n di n richiede tutti
+- **Dispositivo di assemblaggio**: Un token collegato ricostruisce la chiave root; UCM non vede mai la chiave in chiaro né i byte delle quote
+- **CRL prima della cancellazione**: La cancellazione è bloccata finché la CRL non è rigenerata; deve essere confermata prima della chiusura
+- **Avviso OCSP**: Se il responder delegato scade prima della prossima cerimonia, la chiusura richiede un riconoscimento esplicito
 `
   }
 }

@@ -9,12 +9,13 @@ import json
 import logging
 
 from models import db
-from models.hsm import HsmProvider, HsmKey
+from models.hsm import HsmProvider, HsmKey, HsmCustodian
 from services.hsm.ecdsa_signature import coordinate_bytes, ecdsa_to_der
 from services.hsm.base_provider import (
     BaseHsmProvider, HsmKeyInfo,
     HsmError, HsmConnectionError, HsmOperationError, HsmConfigError
 )
+from services.hsm.ceremony_service import sync_custodians as _sync_custodians
 from utils.datetime_utils import utc_now
 from utils import hsm_check, pkcs11_config
 
@@ -121,19 +122,25 @@ class HsmService:
         # Check name uniqueness
         if HsmProvider.query.filter_by(name=name).first():
             raise ValueError(f"Provider with name '{name}' already exists")
+
+        config = dict(config or {})
+        custodians = config.pop('custodians', None) if provider_type == 'sc-hsm-cloud' else None
         
         # Create provider
         provider = HsmProvider(
             name=name,
             type=provider_type,
             config='{}',
-            status='unknown',
+            status='offline' if provider_type == 'sc-hsm-cloud' else 'unknown',
             created_by=created_by
         )
-        provider.set_config(config or {})
+        provider.set_config(config)
         
         db.session.add(provider)
         try:
+            db.session.flush()
+            if provider_type == 'sc-hsm-cloud' and custodians is not None:
+                HsmService.sync_custodians(provider, custodians)
             db.session.commit()
         except Exception as _commit_err:
             db.session.rollback()
@@ -142,6 +149,11 @@ class HsmService:
         
         logger.info(f"Created HSM provider: {name} ({provider_type})")
         return provider
+
+    @staticmethod
+    def sync_custodians(provider: HsmProvider, roster: list) -> None:
+        """Assign sc-hsm-cloud custodian roster (write:hsm)."""
+        _sync_custodians(provider, roster)
     
     @staticmethod
     def update_provider(
@@ -177,14 +189,20 @@ class HsmService:
         if config is not None:
             # The form never carries the PIN kept when a new SoftHSM token took over.
             previous_pin = provider.get_config().get('previous_user_pin')
+            config = dict(config)
             if previous_pin and 'previous_user_pin' not in config:
-                config = {**config, 'previous_user_pin': previous_pin}
+                config['previous_user_pin'] = previous_pin
+            custodians = None
+            if provider.type == 'sc-hsm-cloud' and 'custodians' in config:
+                custodians = config.pop('custodians')
             # set_config encrypts sensitive fields and drops mask sentinels
             # ('***'/'********') so an operator updating non-secret fields
             # via the UI doesn't wipe stored credentials.
             provider.set_config(config)
-            # Reset status when config changes
-            provider.status = 'unknown'
+            if custodians is not None:
+                HsmService.sync_custodians(provider, custodians)
+            # Reset status when config changes (keep offline for sc-hsm-cloud)
+            provider.status = 'offline' if provider.type == 'sc-hsm-cloud' else 'unknown'
             provider.error_message = None
         
         provider.updated_at = utc_now()
@@ -329,6 +347,17 @@ class HsmService:
         provider = db.session.get(HsmProvider, provider_id)
         if not provider:
             raise ValueError(f"Provider not found: {provider_id}")
+
+        if provider.type == 'sc-hsm-cloud':
+            from services.hsm.ceremony_service import ensure_ceremony_key
+            existing = ensure_ceremony_key(provider)
+            if existing is None:
+                raise HsmOperationError(
+                    'Create the root key in the SmartCard-HSM ceremony before '
+                    'creating a CA. This provider does not generate a separate '
+                    'key from the CA form.'
+                )
+            return existing
         
         # Validate algorithm
         if algorithm not in HsmKey.VALID_ALGORITHMS:

@@ -2,7 +2,20 @@
 # Optimized for production with security and minimal size
 # Paths aligned with DEB/RPM packages: /opt/ucm/{backend,frontend,data}
 
-# Stage 1: Builder - Install dependencies and build environment
+# Stage 1: Frontend - the built interface is gitignored, so the image
+# produces it. CI uses Node 20. vite.config.js reads VERSION from the
+# repo root, one directory above frontend/.
+FROM node:20-bookworm-slim AS frontend
+
+WORKDIR /src
+COPY VERSION /src/VERSION
+COPY frontend/package.json frontend/package-lock.json /src/frontend/
+WORKDIR /src/frontend
+RUN npm ci
+COPY frontend/ /src/frontend/
+RUN npm run build
+
+# Stage 2: Builder - Install dependencies and build environment
 FROM python:3.13-slim-bookworm AS builder
 
 # Install build dependencies (fallback for packages without prebuilt wheels)
@@ -29,14 +42,17 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r /tmp/requirements.txt && \
     pip install --no-cache-dir --no-deps pyjks==20.0.0
 
-# Stage 2: Runtime - Minimal production image
+# Stage 3: Runtime - Minimal production image
 FROM python:3.13-slim-bookworm
 
 LABEL maintainer="NeySlim <https://github.com/NeySlim>" \
       description="Ultimate CA Manager - Certificate Authority Management System" \
       org.opencontainers.image.source="https://github.com/NeySlim/ultimate-ca-manager"
 
-# Install only runtime dependencies
+# Install only runtime dependencies.
+# SoftHSM stays as before. SmartCard-HSM remote provider needs pcscd, OpenSC
+# (sc-hsm-tool), and the bookworm vpcd IFD handler (vsmartcard-vpcd registers
+# libifdvpcd.so in /etc/reader.conf.d/vpcd against the default vpcd port).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
@@ -45,15 +61,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     softhsm2 \
     libkrb5-3 \
     postgresql-client \
+    pcscd \
+    opensc \
+    opensc-pkcs11 \
+    vsmartcard-vpcd \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user for security
-RUN useradd -r -u 1000 -s /bin/false -d /opt/ucm ucm && \
-    usermod -aG softhsm ucm
+# Create non-root user for security.
+# pcscd's postinst asks systemd-sysusers for the pcscd user and group, then
+# ignores failure. The slim base has no systemd-sysusers, so the group never
+# appears and usermod would abort the build. Create it here when missing.
+# The bridge talks to the PC/SC socket as a member of that group.
+RUN if ! getent group pcscd >/dev/null; then groupadd --system pcscd; fi && \
+    if ! getent passwd pcscd >/dev/null; then \
+        useradd --system --gid pcscd --home-dir /run/pcscd \
+            --shell /usr/sbin/nologin pcscd; \
+    fi && \
+    useradd -r -u 1000 -s /bin/false -d /opt/ucm ucm && \
+    usermod -aG softhsm,pcscd ucm
 
 # SoftHSM tokens live in the data volume, so a recreated container keeps its keys
 RUN sed -i 's#^directories.tokendir.*#directories.tokendir = /opt/ucm/data/softhsm/tokens/#' /etc/softhsm/softhsm2.conf && \
     grep -q '^directories.tokendir = /opt/ucm/data/softhsm/tokens/$' /etc/softhsm/softhsm2.conf
+
+# Confirm vpcd IFD is registered (package ships /etc/reader.conf.d/vpcd).
+# Default CHANNELID 0x8C7B = TCP 35963; the bridge speaks the vpicc side to that port.
+RUN test -f /usr/lib/pcsc/drivers/serial/libifdvpcd.so && \
+    test -f /etc/reader.conf.d/vpcd
 
 # Copy virtual environment from builder
 COPY --from=builder /opt/ucm/venv /opt/ucm/venv
@@ -64,10 +98,9 @@ WORKDIR /opt/ucm
 # Copy application files with proper ownership (same layout as packages)
 COPY --chown=ucm:ucm VERSION /opt/ucm/VERSION
 COPY --chown=ucm:ucm backend/ /opt/ucm/backend/
-# Only the built interface: the server serves frontend/dist, while frontend/
-# as a whole carries the sources and node_modules, several hundred megabytes
-# of build-time dependencies that have no place in a runtime image
-COPY --chown=ucm:ucm frontend/dist/ /opt/ucm/frontend/dist/
+# Only the built interface. The frontend stage discards sources and
+# node_modules; the server serves frontend/dist.
+COPY --from=frontend --chown=ucm:ucm /src/frontend/dist/ /opt/ucm/frontend/dist/
 COPY --chown=ucm:ucm wsgi.py /opt/ucm/wsgi.py
 COPY --chown=ucm:ucm .env.docker.example /opt/ucm/.env.example
 
@@ -90,9 +123,11 @@ ENV PATH="/opt/ucm/venv/bin:$PATH" \
     UCM_BASE_PATH=/opt/ucm \
     DATA_DIR=/opt/ucm/data
 
-# Expose HTTPS port (and optional HTTP protocol port for CDP/OCSP)
+# Expose HTTPS port (and optional HTTP protocol port for CDP/OCSP).
+# RAM_PORT (default 8444) is the SmartCard-HSM ram-client listener on the bridge.
 EXPOSE 8443
 EXPOSE 8080
+EXPOSE 8444
 
 # Declare persistent volumes.
 # /etc/ucm holds master.key — the symmetric key that decrypts every private
@@ -107,12 +142,10 @@ VOLUME ["/etc/ucm", "/opt/ucm/data"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD curl -f -k https://127.0.0.1:8443/health || exit 1
 
-# Copy entrypoint before switching user
-COPY --chown=ucm:ucm docker/entrypoint.sh /entrypoint.sh
+# Entrypoint runs as root so it can start pcscd, then drops to ucm for the
+# RAM bridge and Gunicorn (see docker/entrypoint.sh). SoftHSM paths are unchanged.
+COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-
-# Switch to non-root user
-USER ucm
 
 # Set entrypoint
 ENTRYPOINT ["/entrypoint.sh"]

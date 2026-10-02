@@ -88,7 +88,7 @@ const navGroups = [
     children: [
       { id: 'users', icon: User, labelKey: 'common.users', path: '/users', adminOnly: true },
       { id: 'rbac', icon: Shield, labelKey: 'common.rbac', path: '/rbac', adminOnly: true },
-      { id: 'hsm', icon: Lock, labelKey: 'common.hsm', path: '/hsm', permission: 'read:hsm' },
+      { id: 'hsm', icon: Lock, labelKey: 'common.hsm', path: '/hsm', permissions: ['read:hsm', 'contribute:hsm'] },
       { id: 'audit', icon: ClockCounterClockwise, labelKey: 'common.audit', path: '/audit', permission: 'read:audit' },
       { id: 'logs', icon: Stack, labelKey: 'common.systemLogs', path: '/logs', adminOnly: true },
     ]
@@ -98,7 +98,11 @@ const navGroups = [
 function NavGroup({ group, activePage, isAdmin, hasPermission, expanded, onToggle, expiringCount, isBadgeDismissed, dismissBadge, t }) {
   const visibleChildren = group.children.filter(child => {
     if (child.adminOnly && !isAdmin()) return false
-    if (child.permission && !isAdmin() && !hasPermission(child.permission)) return false
+    if (Array.isArray(child.permissions) && child.permissions.length) {
+      if (!isAdmin() && !child.permissions.some((p) => hasPermission(p))) return false
+    } else if (child.permission && !isAdmin() && !hasPermission(child.permission)) {
+      return false
+    }
     return true
   })
 

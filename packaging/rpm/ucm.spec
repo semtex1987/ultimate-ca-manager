@@ -63,6 +63,7 @@ install -m 644 packaging/firewall/ucm.xml %{buildroot}/usr/lib/firewalld/service
 install -d %{buildroot}%{_sysconfdir}/logrotate.d
 install -m 644 packaging/logrotate/ucm %{buildroot}%{_sysconfdir}/logrotate.d/%{name}
 install -m 644 packaging/rpm/ucm.service %{buildroot}%{_unitdir}/%{name}.service
+install -m 644 packaging/systemd/ucm-ram-bridge.service %{buildroot}%{_unitdir}/%{name}-ram-bridge.service
 install -m 644 packaging/systemd/ucm-watcher.path %{buildroot}%{_unitdir}/%{name}-watcher.path
 install -m 644 packaging/systemd/ucm-watcher.service %{buildroot}%{_unitdir}/%{name}-watcher.service
 
@@ -72,6 +73,7 @@ getent passwd %{name} >/dev/null || useradd -r -g %{name} -d %{ucm_home} -s /sbi
 
 %post
 %systemd_post %{name}.service
+%systemd_post %{name}-ram-bridge.service
 
 # Install sudoers for service management (watcher handles restart/update)
 cat > /etc/sudoers.d/ucm << 'SUDOERSEOF'
@@ -86,6 +88,7 @@ chmod 440 /etc/sudoers.d/ucm
 
 # Enable ucm-watcher path unit for restart/update handling
 systemctl daemon-reload
+systemctl enable ucm-ram-bridge.service 2>/dev/null || true
 systemctl enable ucm-watcher.path
 systemctl start ucm-watcher.path
 
@@ -279,10 +282,12 @@ fi
 
 %preun
 %systemd_preun %{name}.service
+%systemd_preun %{name}-ram-bridge.service
 %systemd_preun %{name}-watcher.path
 
 %postun
 %systemd_postun_with_restart %{name}.service
+%systemd_postun_with_restart %{name}-ram-bridge.service
 
 %files
 %{ucm_home}/
@@ -290,6 +295,7 @@ fi
 %config(noreplace) %{_sysconfdir}/logrotate.d/%{name}
 %dir %{_localstatedir}/log/%{name}/
 %{_unitdir}/%{name}.service
+%{_unitdir}/%{name}-ram-bridge.service
 %{_unitdir}/%{name}-watcher.path
 %{_unitdir}/%{name}-watcher.service
 /usr/lib/firewalld/services/ucm.xml

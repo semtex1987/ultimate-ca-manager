@@ -23,7 +23,7 @@ ROLE_PERMISSIONS = {
         'read:wstep',
         'read:kerberos',
         'read:ad_connector',
-        'read:hsm',
+        'read:hsm', 'contribute:hsm',
         'read:ssh', 'write:ssh', 'delete:ssh',
         'read:policies', 'read:approvals', 'write:approvals',
         'read:key_recovery', 'write:key_recovery',

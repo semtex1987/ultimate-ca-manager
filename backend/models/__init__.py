@@ -24,7 +24,7 @@ from models.auth_certificate import AuthCertificate
 from models.crl import CRLMetadata
 from models.ocsp import OCSPResponse
 from models.webauthn import WebAuthnCredential, WebAuthnChallenge
-from models.hsm import HsmProvider, HsmKey
+from models.hsm import HsmProvider, HsmKey, HsmCustodian
 from models.rbac import CustomRole, RolePermission
 from models.sso import SSOProvider, SSOSession
 from models.policy import CertificatePolicy, ApprovalRequest
@@ -51,7 +51,7 @@ __all__ = [
     "AcmeAccount", "AcmeOrder", "AcmeAuthorization", "AcmeChallenge", "AcmeNonce",
     "DnsProvider", "AcmeClientOrder", "AcmeDomain", "AcmeLocalDomain", "AcmeEabCredential",
     "AcmeClientAccount",
-    "HsmProvider", "HsmKey",
+    "HsmProvider", "HsmKey", "HsmCustodian",
     "ScanProfile", "ScanRun", "DiscoveredCertificate",
     "SSHCertificateAuthority", "SSHCertificate",
     "CATemplatePin",

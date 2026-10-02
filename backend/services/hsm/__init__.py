@@ -6,6 +6,8 @@ Supports:
 - PKCS#11 (SoftHSM, Thales, nCipher, AWS CloudHSM)
 - Azure Key Vault (Premium tier with HSM)
 - Google Cloud KMS (Cloud HSM)
+- OpenBao / Vault Transit
+- SmartCard-HSM remote (sc-hsm-cloud)
 """
 
 from .hsm_service import HsmService
@@ -48,6 +50,14 @@ def _register_providers():
         from .openbao_provider import OpenBaoProvider, is_available
         if is_available():
             HsmService.register_provider('openbao', OpenBaoProvider)
+    except ImportError:
+        pass
+
+    # SmartCard-HSM remote (RAM bridge)
+    try:
+        from .sc_hsm_cloud_provider import ScHsmCloudProvider, is_available
+        if is_available():
+            HsmService.register_provider('sc-hsm-cloud', ScHsmCloudProvider)
     except ImportError:
         pass
 

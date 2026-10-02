@@ -11,6 +11,7 @@ from utils.public_endpoints import (
     check_host_access,
     get_admin_canonical_origin,
     get_admin_public_host,
+    get_ram_public_origin,
     get_cors_origins,
     get_protocol_effective_url,
     is_split_acme_topology,
@@ -18,6 +19,7 @@ from utils.public_endpoints import (
     validate_admin_base_url,
     validate_acme_public_vhost_host,
     validate_protocol_base_url,
+    validate_ram_public_url,
 )
 
 pytestmark = pytest.mark.usefixtures('clear_public_endpoint_settings')
@@ -25,7 +27,10 @@ pytestmark = pytest.mark.usefixtures('clear_public_endpoint_settings')
 
 @pytest.fixture
 def clear_public_endpoint_settings(app):
-    keys = ('base_url', 'protocol_base_url', 'acme_public_vhost', 'acme_public_port')
+    keys = (
+        'base_url', 'protocol_base_url', 'acme_public_vhost', 'acme_public_port',
+        'ram_public_url',
+    )
     with app.app_context():
         SystemConfig.query.filter(SystemConfig.key.in_(keys)).delete()
         from models import db
@@ -531,3 +536,70 @@ class TestPatchValidation:
         assert ok.status_code == 200
         denied = viewer_client.post('/api/v2/settings/public-endpoints/preflight', json={})
         assert denied.status_code == 403
+
+
+class TestRamPublicOrigin:
+    def test_dedicated_hostname_keeps_port_443_implicit(self):
+        stored, err = validate_ram_public_url('https://ucm-api.example.com')
+        assert err is None
+        assert stored == 'https://ucm-api.example.com'
+
+    def test_explicit_bridge_port_is_kept(self):
+        stored, err = validate_ram_public_url('https://203.0.113.10:8444')
+        assert err is None
+        assert stored == 'https://203.0.113.10:8444'
+
+    def test_path_and_plain_http_rejected(self):
+        _, path_err = validate_ram_public_url('https://ucm-api.example.com/hsm/ram')
+        assert path_err
+        _, http_err = validate_ram_public_url('http://ucm-api.example.com')
+        assert http_err
+
+    def test_env_origin_is_not_rewritten_with_ram_port(self, app, monkeypatch):
+        monkeypatch.setenv('UCM_RAM_PUBLIC_URL', 'https://ucm-api.example.com')
+        monkeypatch.setenv('RAM_PORT', '8444')
+        _set_config(app, 'ram_public_url', 'https://other.example.com:9444')
+        with app.app_context():
+            info = get_ram_public_origin()
+        assert info['mode'] == 'dedicated'
+        assert info['source'] == 'env'
+        assert info['origin'] == 'https://ucm-api.example.com'
+        assert ':8444' not in info['origin']
+
+    def test_config_origin_used_when_env_unset(self, app, monkeypatch):
+        monkeypatch.delenv('UCM_RAM_PUBLIC_URL', raising=False)
+        _set_config(app, 'ram_public_url', 'https://ucm-api.example.com')
+        with app.app_context():
+            info = get_ram_public_origin()
+        assert info == {
+            'origin': 'https://ucm-api.example.com',
+            'mode': 'dedicated',
+            'source': 'config',
+            'listen_port': info['listen_port'],
+        }
+
+    def test_direct_port_uses_admin_host_and_ram_port(self, app, monkeypatch):
+        monkeypatch.delenv('UCM_RAM_PUBLIC_URL', raising=False)
+        monkeypatch.setenv('RAM_PORT', '8444')
+        monkeypatch.setenv('HTTPS_PORT', '8443')
+        _set_config(app, 'base_url', 'https://ucm.thelostmarble.net')
+        _set_config(app, 'ram_public_url', '')
+        with app.app_context():
+            info = get_ram_public_origin()
+        assert info['mode'] == 'direct_port'
+        assert info['origin'] == 'https://ucm.thelostmarble.net:8444'
+
+    def test_settings_save_dedicated_url(self, auth_client, app, monkeypatch):
+        monkeypatch.delenv('UCM_RAM_PUBLIC_URL', raising=False)
+        resp = auth_client.patch(
+            '/api/v2/settings/general',
+            json={'ram_public_url': 'https://ucm-api.example.com'},
+        )
+        assert resp.status_code == 200, resp.get_json()
+        with app.app_context():
+            assert get_ram_public_origin()['origin'] == 'https://ucm-api.example.com'
+        listed = auth_client.get('/api/v2/settings/public-endpoints')
+        assert listed.status_code == 200
+        ram = listed.get_json()['data']['ram']
+        assert ram['origin'] == 'https://ucm-api.example.com'
+        assert ram['mode'] == 'dedicated'

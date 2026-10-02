@@ -1,7 +1,8 @@
 [Unit]
 Description=Ultimate Certificate Manager (UCM)
 Documentation=https://github.com/NeySlim/ultimate-ca-manager
-After=network.target
+After=network.target ucm-ram-bridge.service
+Wants=ucm-ram-bridge.service
 
 [Service]
 Type=simple

@@ -84,6 +84,27 @@ def install_file_handler(logger, formatter) -> Optional[Path]:
     return None
 
 
+def install_follower_handler(logger, formatter) -> Optional[Path]:
+    """Append to the application log without rotating it.
+
+    The RAM bridge is a second process. Rotating the file from there races
+    Gunicorn, which owns rotation. ``WatchedFileHandler`` reopens the path
+    after that rename, and the system log reader parses this same format.
+    """
+    from logging.handlers import WatchedFileHandler
+
+    for path in candidate_paths():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handler = WatchedFileHandler(str(path))
+        except OSError:
+            continue
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        return path
+    return None
+
+
 def resolved_path() -> Optional[Path]:
     """The log file this process writes, or None when it writes to no file."""
     return _resolved_path

@@ -16,6 +16,8 @@ from utils.key_type import issue_key_type_from_template
 from services.file_regen_service import mirror_private_key
 from services.ocsp_service import OCSPService
 from services.trust_store import TrustStoreService
+from services.hsm.ceremony_service import on_operator_change
+from services.hsm.signing_window import operator_offline_blocks
 from utils.ct_client import collect_scts, embed_scts_in_certificate
 from utils.file_naming import cert_cert_path, cert_key_path, cert_csr_path, cleanup_old_files
 from utils.datetime_utils import utc_now
@@ -122,7 +124,7 @@ class LifecycleMixin:
 
         if not ca.crt:
             raise ValueError("CA is awaiting its certificate - cannot sign certificates")
-        if ca.offline:
+        if operator_offline_blocks(ca):
             raise ValueError("CA is offline; restore it before issuing")
         if ca.revoked_in_chain:
             raise ValueError("CA is revoked and can no longer sign")
@@ -478,6 +480,8 @@ class LifecycleMixin:
 
             # Auto-generate CRL if CA has CDP enabled
             ca = CA.query.filter_by(refid=certificate.caref).first() if certificate.caref else None
+            if ca:
+                on_operator_change(ca)
             if ca and ca.cdp_enabled:
                 from services.crl_service import CRLService
                 try:
