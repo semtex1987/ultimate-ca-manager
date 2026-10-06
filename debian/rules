@@ -1,0 +1,90 @@
+#!/usr/bin/make -f
+
+# UCM Debian Build Rules
+
+export DH_VERBOSE=1
+
+%:
+	dh $@
+
+override_dh_auto_install:
+	
+	# Create directory structure
+	install -d debian/ucm/opt/ucm
+	install -d debian/ucm/opt/ucm/backend
+	install -d debian/ucm/opt/ucm/frontend
+	install -d debian/ucm/var/lib/ucm
+	install -d debian/ucm/etc/ucm
+	install -d debian/ucm/var/log/ucm
+	install -d debian/ucm/usr/share/doc/ucm
+	
+	# Copy application files
+	cp -r backend/* debian/ucm/opt/ucm/backend/
+	# A working checkout also holds the database, the sessions and the
+	# private keys under backend/data, plus a virtual environment and
+	# caches. Shared with the local RPM build so the two cannot drift.
+	sh packaging/scripts/prune-runtime-state.sh debian/ucm/opt/ucm/backend
+	# Only copy built frontend (dist/), not node_modules or source
+	cp -r frontend/dist debian/ucm/opt/ucm/frontend/
+	
+	# Copy VERSION file (single source of truth)
+	install -m 644 VERSION debian/ucm/opt/ucm/VERSION
+	
+	# Remove .env files (configuration is created by postinst)
+	rm -f debian/ucm/opt/ucm/.env* debian/ucm/opt/ucm/backend/.env* 2>/dev/null || true
+	
+	# Log rotation for the gunicorn streams (#350). Debhelper registers
+	# anything under /etc as a conffile, so a local edit survives an upgrade.
+	install -D -m 644 packaging/logrotate/ucm debian/ucm/etc/logrotate.d/ucm
+
+	# Install start script
+	install -m 755 packaging/debian/start-ucm.sh debian/ucm/opt/ucm/start-ucm.sh
+	
+	# Install scripts directory
+	install -d debian/ucm/opt/ucm/scripts
+	install -m 755 packaging/scripts/configure-firewall.sh debian/ucm/opt/ucm/scripts/
+	install -m 755 packaging/scripts/ucm-watcher.sh debian/ucm/opt/ucm/scripts/
+	
+	# Install sudoers file for service management
+	install -d debian/ucm/opt/ucm/sudoers
+	install -m 644 packaging/sudoers/ucm debian/ucm/opt/ucm/sudoers/ucm
+	
+	# Install firewall service definitions
+	install -d debian/ucm/usr/lib/firewalld/services
+	install -d debian/ucm/etc/ufw/applications.d
+	install -m 644 packaging/firewall/ucm.xml debian/ucm/usr/lib/firewalld/services/ || true
+	install -m 644 packaging/firewall/ucm-ufw debian/ucm/etc/ufw/applications.d/ucm || true
+	
+	# Install requirements.txt
+	install -m 644 backend/requirements.txt debian/ucm/opt/ucm/requirements.txt
+	
+	# Copy documentation
+	cp README.md debian/ucm/usr/share/doc/ucm/
+	cp DOCKER_QUICKSTART.md debian/ucm/usr/share/doc/ucm/ || true
+	cp LICENSE debian/ucm/usr/share/doc/ucm/ || true
+	
+	# Install systemd service and auto-updater units
+	install -d debian/ucm/lib/systemd/system
+	install -m 644 packaging/debian/ucm.service debian/ucm/lib/systemd/system/
+	install -m 644 packaging/systemd/ucm-ram-bridge.service debian/ucm/lib/systemd/system/
+	install -m 644 packaging/systemd/ucm-watcher.path debian/ucm/lib/systemd/system/
+	install -m 644 packaging/systemd/ucm-watcher.service debian/ucm/lib/systemd/system/
+	
+	# Set permissions
+	find debian/ucm/opt/ucm -type f -exec chmod 644 {} \;
+	find debian/ucm/opt/ucm -type d -exec chmod 755 {} \;
+	chmod +x debian/ucm/opt/ucm/start-ucm.sh
+	chmod +x debian/ucm/opt/ucm/scripts/*.sh
+	chmod +x debian/ucm/opt/ucm/backend/app.py || true
+
+override_dh_installinit:
+	# Skip - we install service manually
+
+override_dh_installsystemd:
+	# Skip - we install service manually to /lib/systemd/system/
+
+override_dh_fixperms:
+	dh_fixperms
+	# Ensure correct permissions for sensitive directories
+	chmod 750 debian/ucm/var/lib/ucm || true
+	chmod 755 debian/ucm/var/log/ucm || true

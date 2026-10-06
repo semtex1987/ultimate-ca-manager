@@ -1,0 +1,50 @@
+Source: ucm
+Section: admin
+Priority: optional
+Maintainer: UCM Development Team <dev@ucm-project.org>
+Build-Depends: debhelper (>= 13),
+               dh-python,
+               python3-all,
+               python3-setuptools,
+               python3-pip
+Standards-Version: 4.6.0
+Homepage: https://github.com/NeySlim/ultimate-ca-manager
+Vcs-Browser: https://github.com/NeySlim/ultimate-ca-manager
+Vcs-Git: https://github.com/NeySlim/ultimate-ca-manager.git
+
+Package: ucm
+Architecture: all
+Depends: ${misc:Depends},
+         python3 (>= 3.12),
+         python3-venv,
+         openssl (>= 1.1.1),
+         adduser,
+         systemd,
+         logrotate
+Recommends: softhsm2
+Suggests: ldap-utils
+Description: Ultimate CA Manager - Certificate Authority Management System
+ UCM (Ultimate CA Manager) is a comprehensive web-based Certificate Authority
+ management system designed for organizations that need to manage their own PKI
+ infrastructure.
+ .
+ Python dependencies are installed in a virtual environment during setup.
+ All dependencies ship as pre-built wheels - no compilation toolchain needed.
+ Kerberos auth for MS CA is optional (pip install requests-kerberos).
+ .
+ Features:
+  * Complete CA lifecycle management
+  * Certificate issuance and revocation
+  * CRL (Certificate Revocation List) generation
+  * ACME protocol support (RFC 8555) - Let's Encrypt compatible
+  * SCEP protocol support - Device enrollment
+  * mTLS authentication
+  * WebAuthn/FIDO2 passwordless login
+  * REST API with JWT authentication
+  * Email notifications
+  * 8 beautiful themes (light/dark variants)
+ .
+ Deployment options:
+  * Standalone (built-in HTTPS server) - No reverse proxy needed
+  * Reverse proxy (nginx/apache recommended for production)
+  * Docker container (ghcr.io/neyslim/ultimate-ca-manager)
