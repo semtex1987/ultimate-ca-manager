@@ -887,3 +887,47 @@ def test_share_write_verifies_assembly_pin_after_logout(bridge_sock):
     bridge_sock.sessions.get_by_custodian = lambda cid: session if str(cid) == '9' else None
     bridge_sock._write_share('9', b'\x11' * 32)
     assert [apdu[1] for apdu in session.apdus] == [0xD7, 0x20, 0xD7]
+
+
+def test_reset_removes_existing_key_before_clearing_dkek(bridge_sock):
+    """A completed device key makes CLEAR KEK and IMPORT return SW=6985.
+
+    The root key file is deleted, then the domain is cleared, and only then
+    can a new share be imported.
+    """
+    seen = []
+
+    def transmit(apdu):
+        seen.append(bytes(apdu))
+        if apdu[0] == 0x80 and apdu[1] == 0x52 and apdu[2] == 0x04:
+            if sum(1 for item in seen if item[1] == 0x52 and item[2] == 0x04) == 1:
+                return bytes((0x69, 0x85))
+            return bytes((0x90, 0x00))
+        if apdu[0] == 0x80 and apdu[1] == 0x52 and apdu[2] == 0x00 and len(apdu) == 5:
+            # Configured 1, outstanding 0: the DKEK is already complete.
+            return bytes((0x01, 0x00, 0x00, 0x00, 0x00, 0x90, 0x00))
+        if apdu[0] == 0x00 and apdu[1] == 0xE4:
+            return bytes((0x90, 0x00))
+        return bytes((0x6A, 0x86))
+
+    bridge_sock.transmit_assembly = transmit
+    bridge_sock._reset_assembly_domain(1)
+    assert [apdu[1] for apdu in seen] == [0x52, 0x52, 0xE4, 0x52]
+    assert seen[2][5:7] == b'\xCC\x01'
+
+
+def test_reset_keeps_an_empty_domain_when_clear_returns_6985(bridge_sock):
+    """CLEAR KEK on a domain that is still waiting for shares can return 6985."""
+    seen = []
+
+    def transmit(apdu):
+        seen.append(bytes(apdu))
+        if apdu[0] == 0x80 and apdu[1] == 0x52 and apdu[2] == 0x04:
+            return bytes((0x69, 0x85))
+        if apdu[0] == 0x80 and apdu[1] == 0x52 and apdu[2] == 0x00 and len(apdu) == 5:
+            return bytes((0x01, 0x01, 0x00, 0x00, 0x00, 0x90, 0x00))
+        return bytes((0x6A, 0x86))
+
+    bridge_sock.transmit_assembly = transmit
+    bridge_sock._reset_assembly_domain(1)
+    assert [apdu[1] for apdu in seen] == [0x52, 0x52]

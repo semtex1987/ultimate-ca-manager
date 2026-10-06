@@ -72,6 +72,7 @@ from services.hsm.sc_hsm_apdu import (
     interpret_share_probe,
     generate_dkek_shares,
     shares_to_import,
+    parse_key_domain_status,
     parse_sw,
     sw_ok,
 )
@@ -748,6 +749,13 @@ class RamBridge:
                         'import share failed SW=6982. The user PIN is not '
                         'verified on the assembly token.'
                     )
+                if sw == '6985':
+                    raise RuntimeError(
+                        'import share failed SW=6985. The assembly card '
+                        'already has a device key and will not take another '
+                        'share. Reinitialize that token in this window, then '
+                        'create the root key again.'
+                    )
                 raise RuntimeError(f'import share failed SW={sw}')
         finally:
             _zeroize(share)
@@ -844,7 +852,6 @@ class RamBridge:
                     'ok': False,
                     'error': f'import share failed SW={sw1:02X}{sw2:02X}',
                 }
-            from services.hsm.sc_hsm_apdu import parse_key_domain_status
             status = parse_key_domain_status(data)
             self.ceremony.mark_change()
             return {'ok': True, 'key_domain': status}
@@ -1188,23 +1195,50 @@ class RamBridge:
                 ids.append(cid)
         return ids
 
+    def _domain_waiting_for_shares(self) -> bool:
+        """True when the default domain still expects every configured share."""
+        rapdu = self.transmit_assembly(apdu_get_key_domain_status())
+        data, sw1, sw2 = parse_sw(rapdu)
+        if not sw_ok(sw1, sw2):
+            return False
+        parsed = parse_key_domain_status(data)
+        outstanding = parsed.get('outstanding_shares')
+        configured = parsed.get('dkek_shares')
+        return bool(outstanding and configured and outstanding == configured)
+
+    def _clear_kek_ready(self) -> bool:
+        """Clear the DKEK. SW=6985 is success only while the domain is still empty."""
+        cleared = self.transmit_assembly(apdu_clear_kek())
+        _, sw1, sw2 = parse_sw(cleared)
+        if sw_ok(sw1, sw2):
+            return True
+        if (sw1, sw2) in ((0x6A, 0x88), (0x6A, 0x82), (0x6A, 0x86)):
+            return True
+        if (sw1, sw2) == (0x69, 0x85):
+            return self._domain_waiting_for_shares()
+        raise RuntimeError(f'clear DKEK failed SW={sw1:02X}{sw2:02X}')
+
     def _reset_assembly_domain(self, share_count: int) -> None:
-        """Clear a partial DKEK so the initialized domain can take new shares.
+        """Clear the initialized domain so it can take a new set of shares.
 
         PKCS#11 places the new key in the default domain created by device
         initialization. Deleting that domain and creating another one leaves
         the key outside the exportable DKEK, and WRAP returns SW=6985.
+        A completed device key also makes CLEAR KEK and IMPORT return SW=6985.
+        The stored root key is removed first, then the domain is cleared.
         ``share_count`` is the threshold the card was initialized with.
         """
         del share_count
-        cleared = self.transmit_assembly(apdu_clear_kek())
-        _, sw1, sw2 = parse_sw(cleared)
-        if sw_ok(sw1, sw2):
+        if self._clear_kek_ready():
             return
-        # No KEK yet, or the empty domain from initialization has nothing to clear.
-        if (sw1, sw2) in ((0x6A, 0x88), (0x6A, 0x82), (0x6A, 0x86), (0x69, 0x85)):
+        self._ignore_missing(self.transmit_assembly(apdu_delete_key_file(ROOT_KEY_ID)))
+        if self._clear_kek_ready():
             return
-        raise RuntimeError(f'clear DKEK failed SW={sw1:02X}{sw2:02X}')
+        raise RuntimeError(
+            'The assembly card already has a device key and will not import '
+            'a new share (SW=6985). Reinitialize that token in this window, '
+            'then create the root key again.'
+        )
 
     def _install_new_root(self, assembly_custodian_id: str) -> dict:
         """Write one share per custodian, import the threshold, and generate the key.
