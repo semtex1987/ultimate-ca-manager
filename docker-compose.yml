@@ -1,6 +1,6 @@
 services:
   ucm:
-    image: ucm:local
+    image: neyslim/ultimate-ca-manager:latest
     container_name: ucm
     restart: unless-stopped
     
@@ -153,7 +153,6 @@ services:
     
     networks:
       - ucm-network
-      - npm_proxy
     
     labels:
       - "com.ultimate-ca-manager.description=Certificate Authority Management"
@@ -165,8 +164,6 @@ networks:
     ipam:
       config:
         - subnet: 172.20.0.0/16
-  npm_proxy:
-    external: true
 
 volumes:
   ucm-data:
