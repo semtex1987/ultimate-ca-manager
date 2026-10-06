@@ -273,7 +273,7 @@ def _custodian_prep_allowed(provider, custodian_id: int) -> Optional[tuple]:
     row = HsmCustodian.query.filter_by(provider_id=provider.id, id=int(custodian_id)).first()
     if row is None:
         return error_response('Custodian not found', 404)
-    if not can_write and row.user_id != getattr(g, 'user_id', None):
+    if not can_write and row.user_id != _current_user_id():
         return error_response('You can prepare only your own token', 403)
     return None
 

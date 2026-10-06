@@ -449,7 +449,7 @@ class FakeCustodianToken:
             lc = apdu[4]
             data = apdu[5:5 + lc]
         if cla == 0x00 and ins == 0xA4:
-            if data == SHARE_EF_FID:
+            if data == SHARE_EF_FID and self._share:
                 return b'\x90\x00'
             return b'\x6A\x82'
         if cla == 0x00 and ins == 0xB0:

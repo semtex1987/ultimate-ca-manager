@@ -1357,14 +1357,9 @@ class RamBridge:
             self.ceremony.remember_user_pin(user_pin)
         try:
             shares = generate_dkek_shares(threshold, total)
-            # Stable order: share index assignment follows custodian id sort
-            # only when ids are the roster order. Use registered token order.
-            custodian_ids = []
-            with self._token_lock:
-                for meta in self._token_map.values():
-                    cid = str(meta['custodian_id'])
-                    if cid not in custodian_ids:
-                        custodian_ids.append(cid)
+            # Same share_index order as create. _token_map is keyed by connect
+            # token, so iterating it does not follow the roster.
+            custodian_ids = self._roster_custodian_ids()
             if len(custodian_ids) != len(shares):
                 raise RuntimeError('custodian roster does not match share count')
             try:

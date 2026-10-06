@@ -371,6 +371,74 @@ def test_contribute_hsm_lists_own_provider(auth_client, app):
     assert 'ram_client_url' not in theirs
 
 
+def test_contribute_custodian_may_inspect_only_own_token(auth_client, app, monkeypatch):
+    """Ownership uses the authenticated user, not a missing g.user_id attribute."""
+    from models.group import Group, GroupMember
+
+    monkeypatch.setattr(
+        'services.hsm.ceremony_service.inspect_token',
+        lambda provider, custodian_id: {'ok': True, 'card': {'state': 'ready'}},
+    )
+
+    with app.app_context():
+        holder = User(username='inspect-holder', email='inspect-holder@example.com', role='viewer')
+        holder.set_password('TestPass123!')
+        db.session.add(holder)
+        other = User(username='inspect-other', email='inspect-other@example.com', role='operator')
+        other.set_password('TestPass123!')
+        db.session.add(other)
+        grp = Group(name='inspect-holders', permissions=['contribute:hsm'])
+        db.session.add(grp)
+        db.session.flush()
+        db.session.add(GroupMember(group_id=grp.id, user_id=holder.id))
+        db.session.commit()
+        holder_id = holder.id
+        other_id = other.id
+
+    create = auth_client.post('/api/v2/hsm/providers', json={
+        'name': 'Inspect Own Token',
+        'type': 'sc-hsm-cloud',
+        'config': {
+            'token_label': 'inspect',
+            'threshold_n': 1,
+            'total_m': 2,
+            'custodians': [
+                {'user_id': holder_id, 'share_index': 1},
+                {'user_id': other_id, 'share_index': 2},
+            ],
+        },
+    })
+    assert create.status_code in (200, 201), create.get_json()
+    pid = (create.get_json().get('data') or create.get_json())['id']
+    with app.app_context():
+        rows = HsmCustodian.query.filter_by(provider_id=pid).all()
+        mine = next(row.id for row in rows if row.user_id == holder_id)
+        theirs = next(row.id for row in rows if row.user_id == other_id)
+
+    client = app.test_client()
+    login = client.post('/api/v2/auth/login', json={
+        'username': 'inspect-holder', 'password': 'TestPass123!',
+    })
+    assert login.status_code == 200, login.get_json()
+
+    own = client.post(f'/api/v2/hsm/providers/{pid}/ceremony/tokens/{mine}/inspect')
+    assert own.status_code == 200, own.get_json()
+    foreign = client.post(f'/api/v2/hsm/providers/{pid}/ceremony/tokens/{theirs}/inspect')
+    assert foreign.status_code == 403, foreign.get_json()
+    assert 'only your own token' in (foreign.get_json().get('message') or '')
+
+
+def test_fake_custodian_select_hides_an_empty_share():
+    from services.hsm.sc_hsm_apdu import FakeCustodianToken, apdu_select_share_ef
+
+    card = FakeCustodianToken(b'\x11' * 32)
+    assert card.transmit(apdu_select_share_ef())[-2:] == b'\x90\x00'
+    card.zeroize()
+    assert card.transmit(apdu_select_share_ef())[-2:] == b'\x6A\x82'
+    card.replace_share(b'\x22' * 32)
+    assert card.transmit(apdu_select_share_ef())[-2:] == b'\x90\x00'
+
+
 def test_missing_share_file_is_not_a_probe_error():
     from services.hsm.sc_hsm_apdu import interpret_share_probe
 
@@ -634,6 +702,42 @@ def test_prepare_refuses_while_root_key_is_assembled(auth_client, app, bridge_so
     assert refused.status_code == 400
     assert 'assembled' in (refused.get_json().get('message') or '').lower()
     assert len(bridge_sock.ceremony.custodian_cards[custodian_id].copy_share()) == 32
+
+
+def test_roll_root_key_follows_share_index_not_token_map(bridge_sock):
+    """Connect tokens are inserted out of share_index order. Roll still writes 1 then 2."""
+    sock = bridge_sock.sock_path
+    begin = call_bridge('begin_ceremony', {
+        'provider_id': 1,
+        'threshold_n': 1,
+        'total_m': 2,
+        'use_fake': True,
+        'custodians': [
+            {'custodian_id': '20', 'connect_token': 'zzz-share-2', 'share_index': 2},
+            {'custodian_id': '10', 'connect_token': 'aaa-share-1', 'share_index': 1},
+        ],
+    }, sock_path=sock)
+    assert begin['ok'] is True, begin
+    for cid in ('10', '20'):
+        assert call_bridge('connect_fake', {'custodian_id': cid}, sock_path=sock)['ok']
+
+    created = call_bridge('create_root_key', {
+        'confirm': 'DELETE',
+        'assembly_custodian_id': '10',
+    }, sock_path=sock)
+    assert created['ok'] is True, created
+
+    order = []
+    original = bridge_sock._write_share
+
+    def _spy(cid, share):
+        order.append(str(cid))
+        return original(cid, share)
+
+    bridge_sock._write_share = _spy
+    rolled = call_bridge('roll_root_key', {}, sock_path=sock)
+    assert rolled['ok'] is True, rolled
+    assert order == ['10', '20']
 
 
 def test_create_root_key_writes_the_first_share(auth_client, app, bridge_sock, monkeypatch):
