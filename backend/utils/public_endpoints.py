@@ -1,7 +1,8 @@
-"""Public endpoint URLs: admin GUI, PKI protocol HTTP, and ACME vhost.
+"""Public endpoint URLs: admin GUI, PKI protocol HTTP, ACME vhost, and RAM.
 
 Single source of truth for canonical admin host, CORS origins, redirect
-targets, and Host-role enforcement (admin vs ACME split topology).
+targets, Host-role enforcement (admin vs ACME split topology), and the
+SmartCard-HSM ram-client origin.
 """
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ _HEALTH_PATHS = frozenset({
 # used to carry its own copy, and they drifted.
 PROTOCOL_PREFIXES = (
     '/cdp/', '/ca/', '/ocsp/', '/scep/', '/.well-known/', '/tsa/', '/ssh/setup/',
+    # SmartCard-HSM ram-client (bridge port; must not swallow admin /hsm)
+    '/hsm/ram/',
     # XCEP/WSTEP (services/wstep/__init__.py, api/xcep_protocol.py): real
     # Windows SOAP clients don't follow POST redirects, so these must never
     # get caught by the canonical-host redirect the way admin UI paths do.
@@ -431,6 +434,136 @@ def validate_admin_base_url(raw: str) -> tuple[Optional[str], Optional[str]]:
     return parsed.stored, None
 
 
+def _netloc_host(host: str) -> str:
+    """Bracket IPv6 so it can sit in a URL netloc next to a port."""
+    if ':' in host and not host.startswith('['):
+        return f'[{host}]'
+    return host
+
+
+def _ram_listen_port() -> int:
+    """Port the RAM bridge process binds. Not the port ram-client is told."""
+    raw = os.getenv('RAM_PORT', '8444')
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        return 8444
+    if port < 1 or port > 65535:
+        return 8444
+    return port
+
+
+def validate_ram_public_url(raw: str) -> tuple[Optional[str], Optional[str]]:
+    """Return (stored_origin, error). HTTPS origin for ram-client, or empty.
+
+    Accepts an FQDN or an IP. An explicit port is kept, including 443.
+    A path is rejected: the custodian URL always appends ``/hsm/ram/<token>``.
+    """
+    text = (raw or '').strip()
+    if not text:
+        return '', None
+    if '://' not in text:
+        text = f'https://{text}'
+    parts = urlsplit(text)
+    if parts.username or parts.password or parts.query or parts.fragment:
+        return None, 'ram_public_url must be scheme, host, and optional port only'
+    if parts.path not in ('', '/'):
+        return None, 'ram_public_url must not include a path'
+    scheme = (parts.scheme or '').lower()
+    if scheme != 'https':
+        return None, 'ram_public_url must use https://'
+    host = (parts.hostname or '').lower()
+    if not host:
+        return None, 'ram_public_url must include a host'
+    name_err = validate_public_host_ssrf(host)
+    if name_err:
+        return None, name_err
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        from utils.ssrf_protection import _forbidden_ip_reason
+        reason = _forbidden_ip_reason(ip, allow_loopback=True)
+        if reason:
+            return None, f'Host {host} is not allowed ({reason})'
+    elif not is_valid_public_vhost(host):
+        return None, 'ram_public_url host must be a hostname or IP address'
+    port = parts.port
+    explicit_port = port is not None
+    if port is None:
+        port = 443
+    if port < 1 or port > 65535:
+        return None, 'ram_public_url port is out of range'
+    host_part = _netloc_host(host)
+    if explicit_port or port != 443:
+        stored = f'https://{host_part}:{port}'
+    else:
+        stored = f'https://{host_part}'
+    return stored, None
+
+
+def ram_public_url_from_env() -> Optional[str]:
+    """Validated ``UCM_RAM_PUBLIC_URL``, or None when unset or unusable."""
+    raw = (os.getenv('UCM_RAM_PUBLIC_URL') or '').strip()
+    if not raw:
+        return None
+    stored, err = validate_ram_public_url(raw)
+    if err or not stored:
+        logger.warning('UCM_RAM_PUBLIC_URL ignored: %s', err or 'empty')
+        return None
+    return stored
+
+
+def ram_public_url_env_locked() -> bool:
+    return bool((os.getenv('UCM_RAM_PUBLIC_URL') or '').strip())
+
+
+def get_ram_public_origin() -> dict:
+    """Origin ram-client should use, without the ``/hsm/ram/<token>`` path.
+
+    ``mode`` is ``dedicated`` when ``UCM_RAM_PUBLIC_URL`` or SystemConfig
+    ``ram_public_url`` is set. The origin is then used as written. ``RAM_PORT``
+    stays the process listen port and is not appended.
+
+    ``mode`` is ``direct_port`` when neither is set. The origin is the admin
+    host plus ``RAM_PORT``, which matches a host that publishes the web UI
+    and the bridge as two ports and has no reverse proxy in front.
+    """
+    listen_port = _ram_listen_port()
+    env_origin = ram_public_url_from_env()
+    if env_origin:
+        return {
+            'origin': env_origin,
+            'mode': 'dedicated',
+            'source': 'env',
+            'listen_port': listen_port,
+        }
+    stored = _config_value('ram_public_url')
+    if stored:
+        normalized, err = validate_ram_public_url(stored)
+        if not err and normalized:
+            return {
+                'origin': normalized,
+                'mode': 'dedicated',
+                'source': 'config',
+                'listen_port': listen_port,
+            }
+        if err:
+            logger.warning('ram_public_url ignored: %s', err)
+    admin = get_admin_canonical_origin()
+    if admin:
+        host = urlsplit(admin).hostname or 'localhost'
+    else:
+        host = os.getenv('UCM_FQDN') or os.getenv('FQDN') or 'localhost'
+    return {
+        'origin': _format_public_origin('https', _netloc_host(host), listen_port),
+        'mode': 'direct_port',
+        'source': 'listen_port',
+        'listen_port': listen_port,
+    }
+
+
 def probe_admin_base_url(normalized: str) -> Optional[str]:
     """Best-effort reachability check of a candidate admin base URL (#303).
 
@@ -673,6 +806,7 @@ def env_locked_fields() -> dict[str, bool]:
         'fqdn_env': bool(os.getenv('UCM_FQDN') or os.getenv('FQDN')),
         'https_port_env': os.getenv('HTTPS_PORT') is not None,
         'http_protocol_port_env': os.getenv('HTTP_PROTOCOL_PORT') is not None,
+        'ram_public_url_env': ram_public_url_env_locked(),
         'cors_extra_origins': bool(os.getenv('CORS_EXTRA_ORIGINS', '').strip()),
     }
 
@@ -699,6 +833,7 @@ def build_effective_endpoints(flask_request=None) -> dict:
         acme_origin = admin_canonical.rstrip('/') if admin_canonical else None
 
     protocol_effective = get_protocol_effective_url() or ''
+    ram_public = get_ram_public_origin()
 
     req_host = _normalize_host(_host_from_request()) if flask_request else None
 
@@ -721,6 +856,13 @@ def build_effective_endpoints(flask_request=None) -> dict:
             'directory_url': f'{acme_origin}/acme' if acme_origin else '',
             'proxy_url': f'{acme_origin}/acme/proxy' if acme_origin else '',
             'split_topology': is_split_acme_topology(),
+        },
+        'ram': {
+            'origin': ram_public['origin'],
+            'mode': ram_public['mode'],
+            'source': ram_public['source'],
+            'listen_port': ram_public['listen_port'],
+            'configured_url': _config_value('ram_public_url'),
         },
         'cors_origins': get_cors_origins(),
         'env_locked': env_locked_fields(),
@@ -942,6 +1084,15 @@ def run_preflight_checks() -> dict:
         port = get_acme_public_port()
         _check_dns('acme', acme)
         _check_tls('acme', acme, port)
+
+    ram_public = get_ram_public_origin()
+    if ram_public['mode'] == 'dedicated':
+        ram_parts = urlsplit(ram_public['origin'])
+        ram_host = ram_parts.hostname or ''
+        ram_port = ram_parts.port or 443
+        if ram_host:
+            _check_dns('ram', ram_host)
+            _check_tls('ram', ram_host, ram_port)
 
     proto_raw = _config_value('protocol_base_url')
     if proto_raw:

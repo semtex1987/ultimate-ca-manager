@@ -219,7 +219,8 @@ class CSRMixin:
         if not ca.crt:
             raise ValueError("CA is awaiting its certificate")
 
-        if ca.offline:
+        from services.hsm.signing_window import operator_offline_blocks
+        if operator_offline_blocks(ca):
             raise ValueError("CA is offline")
 
         if ca.revoked_in_chain:

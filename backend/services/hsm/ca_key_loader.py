@@ -40,6 +40,9 @@ def get_ca_signing_key(ca, *, allow_revoked: bool = False):
     ``RSAPrivateKey`` / ``EllipticCurvePrivateKey`` decoded from
     ``ca.prv``.
 
+    For an offline ``sc-hsm-cloud`` root the assembly key is returned only
+    while :func:`services.hsm.signing_window.signing_window_open` is true.
+
     Raises :class:`ValueError` if neither key source is available, or when
     the CA (or an ancestor) is revoked (#343): every issuance path loads the
     key here, so a revoked CA signs nothing new. Serving its existing CRL
@@ -54,6 +57,14 @@ def get_ca_signing_key(ca, *, allow_revoked: bool = False):
         )
 
     if getattr(ca, 'hsm_key_id', None):
+        # Offline SmartCard-HSM roots only sign inside an open ceremony window.
+        if getattr(ca, 'offline', False):
+            from services.hsm.signing_window import signing_window_open
+            if not signing_window_open(ca):
+                raise ValueError(
+                    f"CA '{getattr(ca, 'descr', ca)}' is offline and no "
+                    "SmartCard-HSM signing window is open"
+                )
         return load_hsm_private_key(ca.hsm_key_id)
 
     if not ca.prv:

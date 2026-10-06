@@ -147,6 +147,17 @@ export default function PublicEndpointsPanel({ settings, updateSetting, refreshK
             value={eff.acme.proxy_url}
           />
         )}
+        {eff.ram?.origin && (
+          <CopyableUrl
+            label={t('settings.publicEndpoints.ramOrigin')}
+            value={eff.ram.origin}
+            description={
+              eff.ram.mode === 'dedicated'
+                ? t('settings.publicEndpoints.ramOriginDedicated', { port: eff.ram.listen_port })
+                : t('settings.publicEndpoints.ramOriginDirect', { port: eff.ram.listen_port })
+            }
+          />
+        )}
         {eff.acme?.split_topology && (
           <Badge variant="info" size="sm">{t('settings.publicEndpoints.splitTopology')}</Badge>
         )}

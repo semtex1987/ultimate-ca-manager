@@ -351,6 +351,35 @@ server {
 }
 ```
 
+The block above is the **web UI** only. Do not add `location /hsm/ram/` there. SmartCard-HSM `ram-client` speaks HTTP POST, and the web UI answers that path with HTTP 405.
+
+If keyholders connect over the public internet, give the RAM bridge its own hostname and set `UCM_RAM_PUBLIC_URL` to it (no port, when the proxy listens on 443). Forward that name to the host port published for container port `8444`. If you are not using a proxy, leave `UCM_RAM_PUBLIC_URL` unset and publish `8443` and `8444`; the ceremony page then uses `https://<host>:8444/hsm/ram/<token>`. Token preparation, reinitialize, the first root key, and later assembly are documented in [HSM_DOCKER.md](../HSM_DOCKER.md).
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name ucm-api.example.com;
+
+    ssl_certificate     /etc/nginx/ssl/ucm-api.crt;
+    ssl_certificate_key /etc/nginx/ssl/ucm-api.key;
+
+    location /hsm/ram/ {
+        proxy_pass https://127.0.0.1:8444;
+        proxy_ssl_verify off;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        client_max_body_size 1m;
+    }
+}
+```
+
+```yaml
+environment:
+  - UCM_RAM_PUBLIC_URL=https://ucm-api.example.com
+```
+
 **Important:** Add the proxy origin to UCM's CORS allowlist:
 ```bash
 # In .env or docker-compose environment

@@ -107,7 +107,8 @@ def issue_tsa_signer_certificate(*, ca, cn=None, validity_days=None,
         raise TsaSignerIssueError('CA private key not available', 400)
     if not ca.crt:
         raise TsaSignerIssueError('CA is awaiting its certificate', 400)
-    if ca.offline:
+    from services.hsm.signing_window import operator_offline_blocks
+    if operator_offline_blocks(ca):
         raise TsaSignerIssueError('CA is offline; restore it before issuing', 400)
     if ca.revoked_in_chain:
         raise TsaSignerIssueError('CA is revoked and can no longer issue certificates', 400)

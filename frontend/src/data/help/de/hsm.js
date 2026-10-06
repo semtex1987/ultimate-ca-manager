@@ -2,7 +2,7 @@ export default {
   helpContent: {
     title: 'Hardware-Sicherheitsmodule',
     subtitle: 'Externe Schlüsselspeicherung',
-    overview: 'Integration mit Hardware-Sicherheitsmodulen für sichere Speicherung privater Schlüssel. Unterstützung für PKCS#11, AWS CloudHSM, Azure Key Vault, Google Cloud KMS und OpenBao/Vault Transit.',
+    overview: 'Integration mit Hardware-Sicherheitsmodulen für sichere Speicherung privater Schlüssel. Unterstützung für PKCS#11, AWS CloudHSM, Azure Key Vault, Google Cloud KMS, OpenBao/Vault Transit und SmartCard-HSM (remote).',
     sections: [
       {
         title: 'Unterstützte Anbieter',
@@ -12,6 +12,7 @@ export default {
           { term: 'Azure Key Vault', description: 'Microsoft Azure verwalteter Schlüsselspeicher' },
           { term: 'Google KMS', description: 'Google Cloud Key Management Service' },
           { term: 'OpenBao / Vault Transit', description: 'OpenBao- oder Vault-Transit-Secrets-Engine für Schlüsselverwaltung als Dienst' },
+          { term: 'SmartCard-HSM (remote)', description: 'Offline-Root mit Schwellenwert-DKEK-Shares auf USB-SmartCard-HSM-Tokens; ram-client tritt über RAMOverHTTP einem Signaturfenster bei' },
         ]
       },
       {
@@ -32,6 +33,24 @@ export default {
           { label: 'Export-Einschränkungen', text: 'PKCS#12-, JKS- und Key-only-Exporte sind für HSM-CAs deaktiviert (nur das öffentliche Zertifikat / die Chain können exportiert werden)' },
           { label: 'CRL & OCSP', text: 'Beide funktionieren transparent mit HSM-CAs (signiert via HSM)' },
           { label: 'Migration', text: 'Bestehende lokale CAs können nach der Erstellung nicht in einen HSM verschoben werden, bei der Erstellung wählen' },
+        ]
+      },
+
+      {
+        title: 'SmartCard-HSM Offline-Root',
+        content: 'Anbietertyp sc-hsm-cloud sichert einen Offline-Root mit n-von-m DKEK-Shares auf USB-Tokens. UCM speichert nur den gewrappten Root-Blob und Zeremonie-URLs — niemals Share-Bytes.',
+        items: [
+          { label: 'Schwelle n / gesamt m', text: 'Konfigurieren, wie viele Shares verbunden sein müssen und wie viele Verwahrer Tokens halten' },
+          { label: 'Schlüsselverwahrer-Zuweisung', text: 'Jeden Share-Index einem UCM-Benutzer mit contribute:hsm zuordnen; write:hsm verwaltet die Liste' },
+          { label: 'Signaturfenster', text: 'Ein Operator öffnet ein Fenster nur für Root-Aktionen. Protokolle (ACME, SCEP, EST, WSTEP) bleiben verweigert, solange ca.offline gesetzt ist' },
+          { label: 'ram-client', text: 'Jeder Verwahrer sieht nur seinen eigenen Einmal-Befehl und den Status: wartend, verbunden oder beigetragen' },
+          { label: 'Token prüfen', text: 'Liest den Key-Domain-Status und ob die Share-Datei CF01 existiert. SW=6A82 heißt: die Karte hat geantwortet und hat noch keine Share-Datei' },
+          { label: 'Gerät neu initialisieren', text: 'Wie „Initialize device“ in der CardContact-Shell. Löscht alle Schlüssel und Dateien und setzt genau ein Schema: DKEK-Shares (für diese Zeremonie), zufälliges DKEK, kein DKEK oder Key-Domains. Die SO-PIN ist der aktuelle Initialisierungscode. DELETE eingeben. Schreibt keine Shares' },
+          { label: 'Token vorbereiten', text: 'Löscht Share-Datei und Key Domain auf einer Karte, die bereits eine Key-Share-Domain hat. DELETE eingeben' },
+          { label: 'Root-Schlüssel erzeugen', text: 'Erste Zeremonie. Alle Verwahrer müssen verbunden sein. Erzeugt den Schlüssel, schreibt auf jeden Token eine Share und speichert den gewrappten Root. DELETE eingeben' },
+          { label: 'Assembly-Gerät', text: 'Späteres Fenster. Liest vorhandene Share-Dateien. Jede Schwelle anwesender Share-Inhaber kann aufbauen; der letzte Assembly-Token muss nicht da sein. Bei n-von-n blockiert ein fehlender Token' },
+          { label: 'CRL vor Wipe', text: 'Wipe ist blockiert, bis die CRL nach der letzten Änderung regeneriert wurde; Wipe muss vor dem Schließen bestätigt werden' },
+          { label: 'OCSP-Responder', text: 'Läuft der delegierte Responder vor der nächsten Zeremonie ab, erfordert das Schließen eine ausdrückliche Bestätigung — kein stilles Schließen' },
         ]
       },
 
@@ -105,6 +124,21 @@ Unterstützte Schlüsseltypen:
 - AES-256-GCM (symmetrisch)
 
 > 💡 OpenBao ist ein Community-Fork von HashiCorp Vault. UCM funktioniert mit beiden.
+
+
+### SmartCard-HSM (remote)
+Offline-Root mit USB-SmartCard-HSM-Tokens (\`sc-hsm-cloud\`). Unterschiedlich von AWS CloudHSM.
+
+- **Schwelle n / gesamt m**: Wie viele Shares verbunden sein müssen und wie viele Verwahrer Tokens halten
+- **Schlüsselverwahrer**: Jeder Share-Index gehört zu einem UCM-Benutzer (\`contribute:hsm\` tritt bei; \`write:hsm\` verwaltet die Liste)
+- **Signaturfenster**: Operator öffnet ein Fenster für Root-Aktionen (CRL, Widerruf, untergeordnete CA, OCSP-Responder, Root-Rekey). Protokolle bleiben verweigert; \`ca.offline\` bleibt gesetzt
+- **ram-client**: Jeder Verwahrer führt einen nur ihm gezeigten Einmal-Befehl aus; Status wartend, verbunden oder beigetragen. ram-client nicht als Dauer-Dienst betreiben
+- **Bereit**: Für DKEK-Shares initialisiert, leere Key Domain, keine Datei \`CF01\`. **Token prüfen** liest das. \`SW=6A82\` heißt, die Share-Datei fehlt noch
+- **Gerät neu initialisieren**: Wie CardContact „Initialize device“. Löscht alle Schlüssel und Dateien und setzt ein Schema (für UCM: DKEK-Shares). SO-PIN ist der aktuelle Initialisierungscode. \`DELETE\` eingeben. \`SW=6982\` ist die falsche SO-PIN, \`SW=6A80\` abgelehnte Initialisierungsdaten, \`SW=6D00\` heißt: keine Key-Share-Domain
+- **Root-Schlüssel erzeugen**: Erste Zeremonie, alle \`m\` Tokens verbunden. Schreibt die erste Share. **Assembly-Gerät** liest nur Shares, die schon auf den Tokens liegen. Beim nächsten Fenster kann jede anwesende Schwelle aufbauen; n-von-n braucht jeden Token
+- **Assembly-Gerät**: Ein verbundener Token baut den Root-Schlüssel für das Fenster neu auf; UCM sieht weder Klartext-Schlüssel noch Share-Bytes
+- **CRL vor Wipe**: Wipe ist blockiert, bis die CRL nach der letzten Änderung regeneriert wurde; Wipe muss vor dem Schließen bestätigt werden
+- **OCSP-Warnung**: Läuft der delegierte Responder vor der nächsten Zeremonie ab, erfordert das Schließen eine ausdrückliche Bestätigung
 
 ## Anbieter verwalten
 

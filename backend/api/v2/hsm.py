@@ -8,13 +8,15 @@ Supports:
 - Google Cloud KMS
 """
 
+from typing import Optional
+
 from flask import Blueprint, request, g
-from auth.unified import require_auth
+from auth.unified import has_permission, require_auth
 from utils.response import success_response, error_response, created_response, no_content_response
 from services.hsm import HsmService
 from services.hsm.base_provider import HsmError, HsmConnectionError, HsmOperationError, HsmConfigError
 from models import db, CA
-from models.hsm import HsmProvider, HsmKey
+from models.hsm import HsmProvider, HsmKey, HsmCustodian
 from services.audit_service import AuditService
 import logging
 
@@ -33,7 +35,14 @@ def _audit_user():
     user = getattr(g, 'current_user', None)
     if user is None:
         return None, None
+    if isinstance(user, dict):
+        return user.get('id'), user.get('username')
     return getattr(user, 'id', None), getattr(user, 'username', None)
+
+
+def _current_user_id():
+    user_id, _username = _audit_user()
+    return user_id
 
 
 # =============================================================================
@@ -41,15 +50,32 @@ def _audit_user():
 # =============================================================================
 
 @bp.route('/api/v2/hsm/providers', methods=['GET'])
-@require_auth(['read:hsm'])
+@require_auth()
 def list_providers():
     """
-    List all HSM providers
-    
-    Returns:
-        List of provider objects with status and key counts
+    List HSM providers.
+
+    ``read:hsm`` sees every provider. ``contribute:hsm`` without read sees
+    only sc-hsm-cloud providers where the caller is a custodian.
     """
+    from auth.unified import has_permission as _has_perm
+    perms = getattr(g, 'permissions', None) or []
+    can_read = '*' in perms or _has_perm('read:hsm', perms)
+    can_contribute = '*' in perms or _has_perm('contribute:hsm', perms)
+    if not can_read and not can_contribute:
+        return error_response('Permission required: read:hsm or contribute:hsm', 403)
+
     providers = HsmService.list_providers()
+    if not can_read:
+        uid = _current_user_id()
+        allowed_ids = {
+            row.provider_id
+            for row in HsmCustodian.query.filter_by(user_id=uid).all()
+        }
+        providers = [
+            p for p in providers
+            if p.get('type') == 'sc-hsm-cloud' and p.get('id') in allowed_ids
+        ]
     return success_response(data=providers)
 
 
@@ -134,16 +160,409 @@ def create_provider():
 
 
 @bp.route('/api/v2/hsm/providers/<int:provider_id>', methods=['GET'])
-@require_auth(['read:hsm'])
+@require_auth()
 def get_provider(provider_id):
-    """Get HSM provider details"""
+    """Get HSM provider details (sc-hsm-cloud includes ceremony + custodian URLs)."""
+    from auth.unified import has_permission as _has_perm
+    perms = getattr(g, 'permissions', None) or []
+    if '*' not in perms and not (
+        _has_perm('read:hsm', perms) or _has_perm('contribute:hsm', perms)
+    ):
+        return error_response('Permission required: read:hsm or contribute:hsm', 403)
+
     provider = HsmService.get_provider(provider_id)
     
     if not provider:
         return error_response('Provider not found', 404)
+
+    if provider.type == 'sc-hsm-cloud':
+        from services.hsm.ceremony_service import detail_dict
+        user_id = _current_user_id()
+        can_write = '*' in perms or _has_perm('write:hsm', perms)
+        can_contribute = '*' in perms or _has_perm('contribute:hsm', perms) or can_write
+        return success_response(
+            data=detail_dict(
+                provider,
+                viewer_user_id=user_id,
+                viewer_can_write_hsm=can_write,
+                viewer_can_contribute_hsm=can_contribute,
+                include_config=True,
+            )
+        )
     
-    # Include masked config in single-provider view
+    if '*' not in perms and not _has_perm('read:hsm', perms):
+        return error_response('Permission required: read:hsm', 403)
     return success_response(data=provider.to_dict(include_config=True))
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/begin', methods=['POST'])
+@require_auth(['write:hsm'])
+def ceremony_begin(provider_id):
+    """Open an offline-root signing window for sc-hsm-cloud."""
+    provider = HsmService.get_provider(provider_id)
+    if not provider:
+        return error_response('Provider not found', 404)
+    if provider.type != 'sc-hsm-cloud':
+        return error_response('Ceremony is only available for sc-hsm-cloud providers', 400)
+    try:
+        from services.hsm.ceremony_service import begin_ceremony, detail_dict
+        begin_ceremony(provider)
+        data = detail_dict(
+            provider,
+            viewer_user_id=_current_user_id(),
+            viewer_can_write_hsm=True,
+            viewer_can_contribute_hsm=True,
+        )
+        AuditService.log_action(
+            action='hsm_ceremony_begin',
+            resource_type='hsm_provider',
+            resource_id=provider_id,
+            resource_name=provider.name,
+            details=f'Signing window opened for {provider.name}',
+            success=True,
+        )
+        return success_response(data=data, message='Signing window opened')
+    except ValueError as e:
+        return error_response(str(e), 400)
+    except Exception as e:
+        logger.exception('ceremony begin failed')
+        return error_response(str(e) or 'Failed to begin ceremony', 500)
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/assembly-slot', methods=['POST'])
+@require_auth(['write:hsm'])
+def ceremony_assembly_slot(provider_id):
+    """Select which connected custodian token is the assembly device."""
+    provider = HsmService.get_provider(provider_id)
+    if not provider:
+        return error_response('Provider not found', 404)
+    if provider.type != 'sc-hsm-cloud':
+        return error_response('Ceremony is only available for sc-hsm-cloud providers', 400)
+    data = request.get_json(silent=True) or {}
+    if 'share_index' not in data:
+        return error_response('share_index is required', 400)
+    try:
+        from services.hsm.ceremony_service import set_assembly_slot, detail_dict
+        set_assembly_slot(
+            provider,
+            int(data['share_index']),
+            user_pin=data.get('user_pin') or '',
+        )
+        return success_response(
+            data=detail_dict(
+                provider,
+                viewer_user_id=_current_user_id(),
+                viewer_can_write_hsm=True,
+                viewer_can_contribute_hsm=True,
+            )
+        )
+    except ValueError as e:
+        return error_response(str(e), 400)
+    except Exception as e:
+        logger.exception('set assembly slot failed')
+        return error_response(str(e) or 'Failed to set assembly slot', 500)
+
+
+def _custodian_prep_allowed(provider, custodian_id: int) -> Optional[tuple]:
+    """write:hsm may prep any token. contribute:hsm may prep only their own."""
+    perms = getattr(g, 'permissions', []) or []
+    can_write = '*' in perms or has_permission('write:hsm', perms)
+    can_contrib = can_write or '*' in perms or has_permission('contribute:hsm', perms)
+    if not can_contrib:
+        return error_response('Permission required: contribute:hsm', 403)
+    row = HsmCustodian.query.filter_by(provider_id=provider.id, id=int(custodian_id)).first()
+    if row is None:
+        return error_response('Custodian not found', 404)
+    if not can_write and row.user_id != _current_user_id():
+        return error_response('You can prepare only your own token', 403)
+    return None
+
+
+@bp.route(
+    '/api/v2/hsm/providers/<int:provider_id>/ceremony/tokens/<int:custodian_id>/inspect',
+    methods=['POST'],
+)
+@require_auth()
+def ceremony_inspect_token(provider_id, custodian_id):
+    """Read whether a connected token is ready for a new n-of-m scheme."""
+    provider = HsmService.get_provider(provider_id)
+    if not provider:
+        return error_response('Provider not found', 404)
+    if provider.type != 'sc-hsm-cloud':
+        return error_response('Ceremony is only available for sc-hsm-cloud providers', 400)
+    denied = _custodian_prep_allowed(provider, custodian_id)
+    if denied is not None:
+        return denied
+    from services.hsm.ceremony_service import detail_dict, inspect_token
+    result = inspect_token(provider, custodian_id)
+    if not result.get('ok'):
+        logger.warning(
+            'sc-hsm inspect failed provider=%s custodian=%s error=%s',
+            provider_id,
+            custodian_id,
+            result.get('error'),
+        )
+        return error_response(result.get('error') or 'Inspect failed', 400, {'card': result.get('card')})
+    return success_response(data={
+        'card': result.get('card'),
+        'provider': detail_dict(
+            provider,
+            viewer_user_id=_current_user_id(),
+            viewer_can_write_hsm=True,
+            viewer_can_contribute_hsm=True,
+        ),
+    })
+
+
+@bp.route(
+    '/api/v2/hsm/providers/<int:provider_id>/ceremony/tokens/<int:custodian_id>/prepare',
+    methods=['POST'],
+)
+@require_auth()
+def ceremony_prepare_token(provider_id, custodian_id):
+    """Initialize a blank token, or wipe a DKEK and share file. Requires DELETE."""
+    provider = HsmService.get_provider(provider_id)
+    if not provider:
+        return error_response('Provider not found', 404)
+    if provider.type != 'sc-hsm-cloud':
+        return error_response('Ceremony is only available for sc-hsm-cloud providers', 400)
+    denied = _custodian_prep_allowed(provider, custodian_id)
+    if denied is not None:
+        return denied
+    body = request.get_json(silent=True) or {}
+    from services.hsm.ceremony_service import detail_dict, prepare_token
+    try:
+        result = prepare_token(
+            provider,
+            custodian_id,
+            confirm=body.get('confirm') or '',
+            so_pin=body.get('so_pin') or '',
+            user_pin=body.get('user_pin') or '',
+            reinitialize=bool(body.get('reinitialize')),
+        )
+    except (TypeError, ValueError) as exc:
+        return error_response(str(exc), 400)
+    if not result.get('ok'):
+        logger.warning(
+            'sc-hsm prepare failed provider=%s custodian=%s error=%s',
+            provider_id,
+            custodian_id,
+            result.get('error'),
+        )
+        return error_response(
+            result.get('error') or 'Prepare failed',
+            400,
+            {'card': result.get('card')},
+        )
+    user_id, username = _audit_user()
+    AuditService.log_action(
+        action='hsm_token_prepare',
+        resource_type='hsm_provider',
+        resource_id=provider_id,
+        resource_name=provider.name,
+        details=f'Prepared custodian {custodian_id} state={((result.get("card") or {}).get("state"))}',
+        success=True,
+        user_id=user_id,
+        username=username,
+    )
+    return success_response(data={
+        'card': result.get('card'),
+        'already_ready': bool(result.get('already_ready')),
+        'provider': detail_dict(
+            provider,
+            viewer_user_id=_current_user_id(),
+            viewer_can_write_hsm=True,
+            viewer_can_contribute_hsm=True,
+        ),
+    })
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/acknowledge-ocsp', methods=['POST'])
+@require_auth(['write:hsm'])
+def ceremony_acknowledge_ocsp(provider_id):
+    """Acknowledge OCSP responder expiry warning before wipe."""
+    provider = HsmService.get_provider(provider_id)
+    if not provider:
+        return error_response('Provider not found', 404)
+    if provider.type != 'sc-hsm-cloud':
+        return error_response('Ceremony is only available for sc-hsm-cloud providers', 400)
+    from services.hsm.ceremony_service import acknowledge_ocsp, detail_dict
+    acknowledge_ocsp(provider)
+    return success_response(
+        data=detail_dict(
+            provider,
+            viewer_user_id=_current_user_id(),
+            viewer_can_write_hsm=True,
+            viewer_can_contribute_hsm=True,
+        )
+    )
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/create-key', methods=['POST'])
+@require_auth(['write:hsm'])
+def ceremony_create_key(provider_id):
+    """Create the first root key and write shares. Requires the body confirm DELETE."""
+    provider = HsmService.get_provider(provider_id)
+    if not provider:
+        return error_response('Provider not found', 404)
+    if provider.type != 'sc-hsm-cloud':
+        return error_response('Ceremony is only available for sc-hsm-cloud providers', 400)
+    body = request.get_json(silent=True) or {}
+    if 'share_index' not in body:
+        return error_response('share_index is required', 400)
+    try:
+        from services.hsm.ceremony_service import create_root_key, detail_dict
+        from services.hsm.base_provider import HsmOperationError
+        created = create_root_key(
+            provider,
+            int(body['share_index']),
+            body.get('confirm') or '',
+            user_pin=body.get('user_pin') or '',
+        )
+        user_id, username = _audit_user()
+        AuditService.log_action(
+            action='hsm_ceremony_create_key',
+            resource_type='hsm_provider',
+            resource_id=provider_id,
+            resource_name=provider.name,
+            details=(
+                f'Root key created for {provider.name} on share {body["share_index"]}; '
+                f'shares_written={created.get("shares_written")}'
+            ),
+            success=True,
+            user_id=user_id,
+            username=username,
+        )
+        data = detail_dict(
+            provider,
+            viewer_user_id=_current_user_id(),
+            viewer_can_write_hsm=True,
+            viewer_can_contribute_hsm=True,
+        )
+        return success_response(data=data, message='Root key created')
+    except ValueError as e:
+        return error_response(str(e), 400)
+    except HsmOperationError as e:
+        logger.warning('sc-hsm create root key failed provider=%s error=%s', provider_id, e)
+        return error_response(str(e), 400)
+    except Exception as e:
+        logger.exception('ceremony create key failed')
+        return error_response(str(e) or 'Failed to create root key', 500)
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/roll-key', methods=['POST'])
+@require_auth(['write:hsm'])
+def ceremony_roll_key(provider_id):
+    """Roll the assembled root key. New shares stay on the custodian tokens."""
+    provider = HsmService.get_provider(provider_id)
+    if not provider:
+        return error_response('Provider not found', 404)
+    if provider.type != 'sc-hsm-cloud':
+        return error_response('Ceremony is only available for sc-hsm-cloud providers', 400)
+    try:
+        from services.hsm.ceremony_service import detail_dict, roll_root_key
+        from services.hsm.base_provider import HsmOperationError
+        body = request.get_json(silent=True) or {}
+        rolled = roll_root_key(provider, user_pin=body.get('user_pin') or '')
+        AuditService.log_action(
+            action='hsm_ceremony_roll_key',
+            resource_type='hsm_provider',
+            resource_id=provider_id,
+            resource_name=provider.name,
+            details=(
+                f'Root key rolled for {provider.name}; '
+                f'shares_written={rolled.get("shares_written")}'
+            ),
+            success=True,
+        )
+        data = detail_dict(
+            provider,
+            viewer_user_id=_current_user_id(),
+            viewer_can_write_hsm=True,
+            viewer_can_contribute_hsm=True,
+        )
+        data['public_key_pem'] = rolled.get('public_key_pem')
+        data['cas_resigned'] = rolled.get('cas_resigned')
+        return success_response(data=data, message='Root key rolled')
+    except HsmOperationError as e:
+        return error_response(str(e), 400)
+    except Exception as e:
+        logger.exception('ceremony key roll failed')
+        return error_response(str(e) or 'Key roll failed', 500)
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/wipe', methods=['POST'])
+@require_auth(['write:hsm'])
+def ceremony_wipe(provider_id):
+    """Wipe the rebuilt root key; refuses when CRL is stale."""
+    provider = HsmService.get_provider(provider_id)
+    if not provider:
+        return error_response('Provider not found', 404)
+    if provider.type != 'sc-hsm-cloud':
+        return error_response('Ceremony is only available for sc-hsm-cloud providers', 400)
+    try:
+        from services.hsm.ceremony_service import wipe_assembly, detail_dict
+        from services.hsm.base_provider import HsmOperationError
+        wipe_assembly(provider)
+        AuditService.log_action(
+            action='hsm_ceremony_wipe',
+            resource_type='hsm_provider',
+            resource_id=provider_id,
+            resource_name=provider.name,
+            details='Assembly key wiped and verified',
+            success=True,
+        )
+        return success_response(
+            data=detail_dict(
+                provider,
+                viewer_user_id=_current_user_id(),
+                viewer_can_write_hsm=True,
+                viewer_can_contribute_hsm=True,
+            ),
+            message='Assembly wiped',
+        )
+    except HsmOperationError as e:
+        return error_response(str(e), 400)
+    except Exception as e:
+        logger.exception('ceremony wipe failed')
+        return error_response(str(e) or 'Wipe failed', 500)
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/end', methods=['POST'])
+@require_auth(['write:hsm'])
+def ceremony_end(provider_id):
+    """Close the signing window; requires wipe_confirmed."""
+    provider = HsmService.get_provider(provider_id)
+    if not provider:
+        return error_response('Provider not found', 404)
+    if provider.type != 'sc-hsm-cloud':
+        return error_response('Ceremony is only available for sc-hsm-cloud providers', 400)
+    try:
+        from services.hsm.ceremony_service import end_ceremony, detail_dict
+        from services.hsm.base_provider import HsmOperationError
+        end_ceremony(provider)
+        AuditService.log_action(
+            action='hsm_ceremony_end',
+            resource_type='hsm_provider',
+            resource_id=provider_id,
+            resource_name=provider.name,
+            details='Signing window closed',
+            success=True,
+        )
+        return success_response(
+            data=detail_dict(
+                provider,
+                viewer_user_id=_current_user_id(),
+                viewer_can_write_hsm=True,
+                viewer_can_contribute_hsm=True,
+            ),
+            message='Signing window closed',
+        )
+    except HsmOperationError as e:
+        return error_response(str(e), 400)
+    except Exception as e:
+        logger.exception('ceremony end failed')
+        return error_response(str(e) or 'Failed to end ceremony', 500)
 
 
 @bp.route('/api/v2/hsm/providers/<int:provider_id>', methods=['PUT'])
@@ -721,6 +1140,45 @@ def get_provider_types():
                 'namespace': {'type': 'string', 'required': False, 'description': 'Namespace (optional)'},
                 'tls_skip_verify': {'type': 'boolean', 'required': False, 'description': 'Skip TLS certificate verification'}
             }
+        },
+        {
+            'type': 'sc-hsm-cloud',
+            'label': 'SmartCard-HSM (remote)',
+            'description': (
+                'USB SmartCard-HSM signing window for an offline root via '
+                'ram-client (not AWS CloudHSM). Custodian tokens assemble '
+                'the key for operator root actions, then the key is wiped.'
+            ),
+            'available': 'sc-hsm-cloud' in available,
+            'config_schema': {
+                'token_label': {
+                    'type': 'string', 'required': True,
+                    'description': 'Token label for the key domain',
+                },
+                'threshold_n': {
+                    'type': 'number', 'required': True,
+                    'description': 'Shares required to rebuild the DKEK (n of m)',
+                },
+                'total_m': {
+                    'type': 'number', 'required': True,
+                    'description': 'Total custodians / DKEK shares (m)',
+                },
+                'module_path': {
+                    'type': 'string', 'required': False,
+                    'description': 'OpenSC PKCS#11 module path (optional hint)',
+                },
+                'wrapped_root': {
+                    'type': 'password', 'required': False,
+                    'description': 'DKEK-wrapped root key blob (base64); never the clear key',
+                },
+                'custodians': {
+                    'type': 'array', 'required': True,
+                    'description': (
+                        'Custodian roster: [{user_id, display_name, share_index}]. '
+                        'write:hsm assigns; each gets a connect_token for contribute:hsm.'
+                    ),
+                },
+            }
         }
     ]
     
@@ -798,6 +1256,17 @@ def get_dependencies_status():
         'installed': True,
         'packages': ['requests (built-in)'],
         'install_command': 'No additional packages required'
+    })
+
+    dependencies.append({
+        'provider': 'sc-hsm-cloud',
+        'label': 'SmartCard-HSM (remote)',
+        'installed': True,
+        'packages': ['python-pkcs11 (optional, for live OpenSC signing)'],
+        'install_command': 'Bridge process: python -m services.hsm.ram_bridge',
+        'system_packages': {
+            'debian': 'opensc pcscd vsmartcard-vpcd',
+        },
     })
     
     return success_response(data={

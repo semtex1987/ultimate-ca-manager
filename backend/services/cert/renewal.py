@@ -393,7 +393,8 @@ def renew_certificate_in_place(
         )
     if not ca.crt:
         raise RenewalError('Issuing CA is awaiting its certificate', 400)
-    if ca.offline:
+    from services.hsm.signing_window import operator_offline_blocks
+    if operator_offline_blocks(ca):
         raise RenewalError('CA is offline; restore it before renewing', 400)
     if ca.revoked_in_chain:
         raise RenewalError('CA is revoked and can no longer renew certificates', 400)

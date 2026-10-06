@@ -20,7 +20,13 @@ from services.backup.settings_contract import (
     validate_retention_days,
 )
 from utils.hsts import hsts_env_locked
-from utils.public_endpoints import validate_admin_base_url, validate_protocol_base_url
+from utils.public_endpoints import (
+    get_ram_public_origin,
+    ram_public_url_env_locked,
+    validate_admin_base_url,
+    validate_protocol_base_url,
+    validate_ram_public_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,7 @@ _ADMIN_ONLY_SETTINGS = frozenset({
     'acme_public_vhost',
     'acme_public_port',
     'acme_public_tls_cert_id',
+    'ram_public_url',
     # The whole backup schedule is admin-only, not just its password: an
     # operator who can shorten retention can have the daily task delete the
     # archives, which the dedicated admin:system route never allowed.
@@ -81,6 +88,7 @@ def _int_config(key, default):
 @require_auth(['read:settings'])
 def get_general_settings():
     """Get general settings from database"""
+    ram_public = get_ram_public_origin()
     return success_response(data={
         'site_name': get_config('site_name', 'UCM'),
         'system_name': get_config('system_name', get_config('site_name', 'UCM')),
@@ -104,6 +112,14 @@ def get_general_settings():
         'acme_public_vhost': get_config('acme_public_vhost', ''),
         'acme_public_port': effective('acme_public_port'),
         'acme_public_tls_cert_id': int(get_config('acme_public_tls_cert_id', '0') or 0) or None,
+        'ram_public_url': (
+            ram_public['origin']
+            if ram_public['source'] == 'env'
+            else get_config('ram_public_url', '')
+        ),
+        'ram_public_url_locked': ram_public['source'] == 'env',
+        'ram_public_origin': ram_public['origin'],
+        'ram_public_mode': ram_public['mode'],
         'date_format': effective('date_format'),
         'show_time': effective('show_time'),
         # Password policy
@@ -181,6 +197,7 @@ def update_general_settings():
         'session_max_lifetime', 'max_login_attempts', 'lockout_duration',
         'protocol_base_url', 'http_protocol_port', 'base_url', 'date_format', 'show_time',
         'acme_public_vhost', 'acme_public_port', 'acme_public_tls_cert_id',
+        'ram_public_url',
         # Password policy
         'min_password_length', 'max_password_length',
         'password_require_uppercase', 'password_require_lowercase',
@@ -238,6 +255,18 @@ def update_general_settings():
         if err:
             return error_response(err, 400)
         data['protocol_base_url'] = normalized or ''
+
+    if 'ram_public_url' in data:
+        # The container environment is the infrastructure setting. A general
+        # save sends every field back, so drop this one instead of failing
+        # the rest of the form while UCM_RAM_PUBLIC_URL is set.
+        if ram_public_url_env_locked():
+            data.pop('ram_public_url', None)
+        else:
+            normalized, err = validate_ram_public_url(data.get('ram_public_url') or '')
+            if err:
+                return error_response(err, 400)
+            data['ram_public_url'] = normalized or ''
 
     # Validate http_protocol_port if provided
     if 'http_protocol_port' in data:

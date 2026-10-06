@@ -2451,6 +2451,23 @@ Supported key types:
 
 > 💡 For development, run OpenBao in dev mode: \`docker run -d -p 8200:8200 -e BAO_DEV_ROOT_TOKEN_ID=test-token quay.io/openbao/openbao:latest server -dev\`
 
+### SmartCard-HSM (remote)
+Offline root backed by USB SmartCard-HSM tokens (\`sc-hsm-cloud\`). Distinct from AWS CloudHSM. Tokens do not have to be factory-sealed. The full operator procedure is in \`docs/HSM_DOCKER.md\`.
+
+- **Threshold n / total m**: How many shares must connect and how many custodians hold tokens
+- **Custodian assignment**: Each share index maps to a UCM user (\`contribute:hsm\` joins; \`write:hsm\` manages the roster)
+- **Signing window**: Operator opens a window for root actions (CRL, revoke, subordinate issue/renew, OCSP responder, root rekey). Protocols stay refused; \`ca.offline\` stays set
+- **ram-client**: Each custodian runs a one-shot command shown only to them. With no reverse proxy, that URL is the admin host on the RAM port (8444). Behind a reverse proxy, set \`UCM_RAM_PUBLIC_URL\` (or Settings → RAM public URL) to a second hostname that forwards to that port. Do not send \`/hsm/ram/\` to the admin site (HTTP 405). Do not leave ram-client as a standing service
+- **Ready token**: Initialized for DKEK shares, empty key domain, no share file \`CF01\`. **Check token** reads this. \`SW=6A82\` means the card answered and the share file is not there yet
+- **Card use**: Chosen once on the provider. n-of-m asks for the threshold and the total. No DKEK, a randomly generated DKEK, and key domains are the alternatives; the ceremony does not ask for the scheme again
+- **Reinitialize device**: Clears every key and file and applies the scheme saved on the provider. An n-of-m provider uses the saved threshold as the share count. The SO-PIN is the initialization code currently on the card (the printed 16 hex characters on a factory card). Type \`DELETE\`. \`SW=6982\` is a wrong SO-PIN. \`SW=6A80\` means the card rejected the initialization data. This does not write shares. \`SW=6D00\` on key-domain status means the card is not set up for key shares; reinitialize it
+- **Prepare token**: Deletes the share file and key domain on a card that already has a key-share domain. Type \`DELETE\`
+- **Create root key on this token**: First ceremony. Every custodian must be connected. Generates the key, writes one share onto each token, and stores the wrapped root. Type \`DELETE\`. Refused once a key is already assembled. On hardware, \`SC_HSM_USER_PIN\` in the bridge environment must match the user PIN on the assembly card
+- **Use as assembly device**: A later window. Reads share files that are already on the tokens. Opening the window clears the previous assembly slot, so any threshold of present share-holders can assemble. The token used last time does not have to be present. n-of-n cannot proceed while a token is missing
+- **Roll root key**: Needs an assembled key and every custodian connected, because it writes a new share onto the full roster
+- **CRL before wipe**: Wipe is blocked until the CRL is regenerated after the latest change; wipe must be confirmed before the window closes
+- **OCSP warning**: If the delegated responder expires before the next ceremony, closing requires an explicit acknowledgement
+
 ## Managing Providers
 
 ### Adding a Provider

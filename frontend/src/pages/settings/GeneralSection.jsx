@@ -170,6 +170,25 @@ export default function GeneralSection({ settings, updateSetting, handleSave, sa
             helperText={t('settings.acmePublicTlsCertIdHelper')}
             disabled={!canAdminSettings}
           />
+          <Input
+            label={
+              <span className="flex items-center gap-1">
+                {t('settings.ramPublicUrl')}
+                {(!canAdminSettings || settings.ram_public_url_locked) && (
+                  <Lock size={12} className="text-text-tertiary" />
+                )}
+              </span>
+            }
+            value={settings.ram_public_url || ''}
+            onChange={(e) => updateSetting('ram_public_url', e.target.value)}
+            placeholder={t('settings.ramPublicUrlPlaceholder')}
+            helperText={
+              settings.ram_public_url_locked
+                ? t('settings.ramPublicUrlLocked')
+                : t('settings.ramPublicUrlHelper')
+            }
+            disabled={!canAdminSettings || !!settings.ram_public_url_locked}
+          />
           {canWrite('settings') && (
             <div className="pt-2">
               <Button

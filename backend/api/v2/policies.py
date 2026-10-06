@@ -323,7 +323,8 @@ def _issue_approved_certificate(approval):
         raise ValueError("CA private key not available")
     if not ca.crt:
         raise ValueError("CA is awaiting its certificate")
-    if ca.offline:
+    from services.hsm.signing_window import operator_offline_blocks
+    if operator_offline_blocks(ca):
         raise ValueError("CA is offline; restore it before issuing")
     if ca.revoked_in_chain:
         raise ValueError("CA is revoked and can no longer issue certificates")

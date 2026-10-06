@@ -1240,7 +1240,7 @@ export const helpContent = {
   hsm: {
     title: 'Hardware Security Modules',
     subtitle: 'External key storage',
-    overview: 'Integrate with Hardware Security Modules for secure private key storage. Support for PKCS#11, AWS CloudHSM, Azure Key Vault, Google Cloud KMS, and OpenBao/Vault Transit.',
+    overview: 'Integrate with Hardware Security Modules for secure private key storage. Support for PKCS#11, AWS CloudHSM, Azure Key Vault, Google Cloud KMS, OpenBao/Vault Transit, and SmartCard-HSM (remote).',
     sections: [
       {
         title: 'Supported Providers',
@@ -1251,6 +1251,7 @@ export const helpContent = {
           { term: 'Azure Key Vault', description: 'Microsoft Azure managed key storage' },
           { term: 'Google KMS', description: 'Google Cloud Key Management Service' },
           { term: 'OpenBao / Vault Transit', description: 'OpenBao or HashiCorp Vault Transit Secrets Engine for encryption-as-a-service key management' },
+          { term: 'SmartCard-HSM (remote)', description: 'Offline root with threshold DKEK shares on USB SmartCard-HSM tokens; ram-client joins a signing window over RAMOverHTTP' },
         ]
       },
       {
@@ -1273,6 +1274,26 @@ export const helpContent = {
           { label: 'Export restrictions', text: 'PKCS#12, JKS and key-only exports are disabled for HSM-backed CAs (only the public certificate / chain can be exported)' },
           { label: 'CRL & OCSP', text: 'Both work transparently with HSM-backed CAs (signed via HSM)' },
           { label: 'Migration', text: 'Existing local CAs cannot be moved to an HSM after creation, choose at creation time' },
+        ]
+      },
+      {
+        title: 'SmartCard-HSM offline root',
+        icon: Key,
+        content: 'Provider type sc-hsm-cloud backs an offline root with n-of-m DKEK shares on USB tokens. UCM stores only the wrapped root blob and ceremony connect URLs — never share bytes. A token does not have to be factory-sealed. The operator procedure is in docs/HSM_DOCKER.md.',
+        items: [
+          { label: 'Threshold n / total m', text: 'Configure how many shares must connect and how many custodians hold tokens' },
+          { label: 'Custodian assignment', text: 'Map each share index to a UCM user with contribute:hsm; write:hsm manages the roster' },
+          { label: 'Signing window', text: 'An operator opens a window for root actions only. Protocols (ACME, SCEP, EST, WSTEP) stay refused while ca.offline remains set' },
+          { label: 'ram-client', text: 'Each custodian sees only their own one-shot ram-client command. Direct install uses the admin host on port 8444. Behind a reverse proxy, set a separate hostname (RAM public URL); the admin name returns HTTP 405 for this path' },
+          { label: 'Check token', text: 'Reads key-domain status and whether share file CF01 exists. SW=6A82 means the card answered and has no share file yet' },
+          { label: 'Card use', text: 'Chosen once on the provider. n-of-m asks for threshold and total. No DKEK, a random DKEK, or key domains are the alternatives and are not asked again during the ceremony' },
+          { label: 'Reinitialize device', text: 'Clears every key and file and applies the scheme saved on the provider. An n-of-m provider uses the saved threshold as the share count. SO-PIN is the initialization code currently on the card. Type DELETE. Does not write shares' },
+          { label: 'Prepare token', text: 'Deletes an existing share file and key domain on a card that already has a key-share domain. Type DELETE' },
+          { label: 'Create root key', text: 'First ceremony. Every custodian must be connected. Generates the key, writes one share onto each token, and stores the wrapped root. Type DELETE. Refused once a key is assembled' },
+          { label: 'Assembly device', text: 'A later window. Reads share files already on the connected tokens. Any threshold of present share-holders can assemble; the previous assembly token does not have to be present. n-of-n cannot proceed while a token is missing' },
+          { label: 'Roll root key', text: 'Needs an assembled key and every custodian connected. Writes a new share onto the full roster' },
+          { label: 'CRL before wipe', text: 'Wipe is blocked until the CRL is regenerated after the latest change; wipe must be confirmed before the window closes' },
+          { label: 'OCSP responder', text: 'If the delegated responder expires before the next ceremony, closing requires an explicit acknowledgement — not a silent dismiss' },
         ]
       },
     ],

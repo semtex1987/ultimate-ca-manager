@@ -2,7 +2,7 @@ export default {
   helpContent: {
     title: 'Módulos de Segurança de Hardware',
     subtitle: 'Armazenamento externo de chaves',
-    overview: 'Integre com Módulos de Segurança de Hardware para armazenamento seguro de chaves privadas. Suporte para PKCS#11, AWS CloudHSM, Azure Key Vault, Google Cloud KMS e OpenBao/Vault Transit.',
+    overview: 'Integre com Módulos de Segurança de Hardware para armazenamento seguro de chaves privadas. Suporte para PKCS#11, AWS CloudHSM, Azure Key Vault, Google Cloud KMS, OpenBao/Vault Transit e SmartCard-HSM (remoto).',
     sections: [
       {
         title: 'Provedores Suportados',
@@ -12,6 +12,7 @@ export default {
           { term: 'Azure Key Vault', description: 'Armazenamento gerenciado de chaves do Microsoft Azure' },
           { term: 'Google KMS', description: 'Google Cloud Key Management Service' },
           { term: 'OpenBao / Vault Transit', description: 'OpenBao ou Vault Transit Secrets Engine para gerenciamento de chaves como serviço' },
+          { term: 'SmartCard-HSM (remoto)', description: 'Raiz offline com partilhas DKEK de limiar em tokens USB SmartCard-HSM; ram-client junta-se a uma janela de assinatura via RAMOverHTTP' },
         ]
       },
       {
@@ -32,6 +33,24 @@ export default {
           { label: 'Restrições de exportação', text: 'Exportações PKCS#12, JKS e somente-chave são desabilitadas para CAs HSM (só o certificado público / cadeia podem ser exportados)' },
           { label: 'CRL & OCSP', text: 'Ambos funcionam de forma transparente com CAs HSM (assinados via HSM)' },
           { label: 'Migração', text: 'CAs locais existentes não podem ser movidas para um HSM após a criação, escolher na criação' },
+        ]
+      },
+
+      {
+        title: 'Raiz offline SmartCard-HSM',
+        content: 'O tipo de fornecedor sc-hsm-cloud protege uma raiz offline com partilhas DKEK n de m em tokens USB. O UCM armazena apenas o blob envolvido e os URL de cerimónia — nunca bytes de partilha.',
+        items: [
+          { label: 'Limiar n / total m', text: 'Configure quantas partilhas devem ligar-se e quantos custodians têm tokens' },
+          { label: 'Atribuição de custodians', text: 'Mapeie cada índice de partilha a um utilizador UCM com contribute:hsm; write:hsm gere a lista' },
+          { label: 'Janela de assinatura', text: 'Um operador abre uma janela só para ações de raiz. Os protocolos (ACME, SCEP, EST, WSTEP) continuam recusados enquanto ca.offline estiver definido' },
+          { label: 'ram-client', text: 'Cada custodian vê apenas o seu comando de utilização única e o estado: a aguardar, ligado ou contribuído' },
+          { label: 'Verificar token', text: 'Lê o estado do domínio de chaves e se existe o ficheiro de partilha CF01. SW=6A82 significa que o cartão respondeu e ainda não tem esse ficheiro' },
+          { label: 'Reinicializar dispositivo', text: 'Igual a Initialize device do CardContact. Apaga todas as chaves e ficheiros e define um esquema: partilhas DKEK (use este), DKEK aleatório, sem DKEK ou domínios de chaves. O SO-PIN é o código de inicialização atual. Escreva DELETE. Não escreve partilhas' },
+          { label: 'Preparar token', text: 'Apaga o ficheiro de partilha e o domínio num cartão que já tem domínio de partilhas. Escreva DELETE' },
+          { label: 'Criar chave de raiz', text: 'Primeira cerimónia. Todos os custodians têm de estar ligados. Gera a chave, escreve uma partilha em cada token e guarda a raiz envolvida. Escreva DELETE' },
+          { label: 'Dispositivo de montagem', text: 'Janela seguinte. Lê partilhas que já estão nos tokens. Qualquer limiar de presentes pode montar; o token da vez anterior não tem de estar. n de n não avança se faltar um token' },
+          { label: 'CRL antes do apagamento', text: 'O apagamento fica bloqueado até a CRL ser regenerada após a última alteração; o apagamento deve ser confirmado antes de fechar' },
+          { label: 'Respondedor OCSP', text: 'Se o respondedor delegado expirar antes da próxima cerimónia, o fecho exige um reconhecimento explícito — não um fecho silencioso' },
         ]
       },
 
@@ -141,6 +160,20 @@ Ao criar uma CA, selecione um provedor HSM e uma chave em vez de gerar uma chave
 > ⚠ Chaves geradas em um HSM não podem ser exportadas. Se você perder acesso ao HSM, você perde as chaves.
 
 > 💡 Use SoftHSM para desenvolvimento e testes antes de implantar com HSMs físicos.
+
+### SmartCard-HSM (remoto)
+Raiz offline com tokens USB SmartCard-HSM (\`sc-hsm-cloud\`). Distinto do AWS CloudHSM.
+
+- **Limiar n / total m**: Quantas partilhas devem ligar-se e quantos custodians têm tokens
+- **Custodians**: Cada índice de partilha mapeia para um utilizador UCM (\`contribute:hsm\` junta-se; \`write:hsm\` gere a lista)
+- **Janela de assinatura**: O operador abre uma janela para ações de raiz. Os protocolos continuam recusados; \`ca.offline\` permanece
+- **ram-client**: Cada custodian executa um comando de utilização única mostrado só a si; estado a aguardar, ligado ou contribuído
+- **Pronto**: Inicializado para partilhas DKEK, domínio vazio, sem ficheiro \`CF01\`. **Verificar token** lê isto. \`SW=6A82\` significa que o ficheiro de partilha ainda não existe
+- **Reinicializar dispositivo**: Igual a Initialize device do CardContact. Apaga chaves e ficheiros e define um esquema (para o UCM: partilhas DKEK). O SO-PIN é o código atual. Escreva \`DELETE\`. \`SW=6982\` SO-PIN errado; \`SW=6A80\` dados recusados; \`SW=6D00\` sem domínio de partilhas
+- **Criar chave de raiz**: Primeira cerimónia, os \`m\` tokens ligados. Escreve a primeira partilha. **Dispositivo de montagem** só lê partilhas já presentes. Na janela seguinte qualquer limiar presente chega; n de n exige todos
+- **Dispositivo de montagem**: Um token ligado reconstrói a chave de raiz; o UCM nunca vê a chave em claro nem bytes de partilha
+- **CRL antes do apagamento**: O apagamento fica bloqueado até regenerar a CRL; deve ser confirmado antes de fechar
+- **Aviso OCSP**: Se o respondedor delegado expirar antes da próxima cerimónia, o fecho exige reconhecimento explícito
 `
   }
 }

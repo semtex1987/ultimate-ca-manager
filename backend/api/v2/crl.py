@@ -116,12 +116,10 @@ def regenerate_crl(ca_id):
     if not ca.crt:
         return error_response(f'CA "{ca.descr}" is awaiting its certificate - cannot generate CRL', 409)
         
-    # Check offline status
-    if ca.offline:
-        return error_response(
-            f"Cannot regenerate CRL: CA '{ca.descr}' is offline ({ca.offline_reason or 'no reason provided'})",
-            400
-        )
+    # Check offline status (signing window is the sole operator exception)
+    from services.hsm.signing_window import operator_offline_blocks, offline_block_message
+    if operator_offline_blocks(ca):
+        return error_response(offline_block_message(ca, action='regenerate CRL'), 400)
     
     try:
         crl_metadata = CRLService.generate_crl(ca.id, username=getattr(g, 'user', {}).get('username', 'admin') if hasattr(g, 'user') else 'admin')

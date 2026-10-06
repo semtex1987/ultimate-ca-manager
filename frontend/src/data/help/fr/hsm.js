@@ -2,7 +2,7 @@ export default {
   helpContent: {
     title: 'Modules de sécurité matériels',
     subtitle: 'Stockage de clés externe',
-    overview: 'Intégrez des modules de sécurité matériels pour le stockage sécurisé des clés privées. Prend en charge PKCS#11, AWS CloudHSM, Azure Key Vault, Google Cloud KMS et OpenBao/Vault Transit.',
+    overview: 'Intégrez des modules de sécurité matériels pour le stockage sécurisé des clés privées. Prend en charge PKCS#11, AWS CloudHSM, Azure Key Vault, Google Cloud KMS, OpenBao/Vault Transit et SmartCard-HSM (distant).',
     sections: [
       {
         title: 'Fournisseurs pris en charge',
@@ -12,6 +12,7 @@ export default {
           { term: 'Azure Key Vault', description: 'Stockage de clés géré Microsoft Azure' },
           { term: 'Google KMS', description: 'Service de gestion des clés Google Cloud' },
           { term: 'OpenBao / Vault Transit', description: 'Moteur de secrets Transit OpenBao ou HashiCorp Vault pour la gestion de clés en chiffrement-as-a-service' },
+          { term: 'SmartCard-HSM (distant)', description: 'Racine hors ligne avec parts DKEK à seuil sur jetons USB SmartCard-HSM ; ram-client rejoint une fenêtre de signature via RAMOverHTTP' },
         ]
       },
       {
@@ -32,6 +33,24 @@ export default {
           { label: 'Restrictions d\'export', text: 'L\'export PKCS#12, JKS et clé seule est désactivé pour les CA HSM (seul le certificat public / la chaîne peut être exporté)' },
           { label: 'CRL & OCSP', text: 'Les deux fonctionnent de manière transparente avec les CA HSM (signés via HSM)' },
           { label: 'Migration', text: 'Les CA locales existantes ne peuvent pas être déplacées vers un HSM après création, choisir à la création' },
+        ]
+      },
+
+      {
+        title: 'Racine hors ligne SmartCard-HSM',
+        content: 'Le type de fournisseur sc-hsm-cloud sécurise une racine hors ligne avec des parts DKEK n sur m sur jetons USB. UCM ne stocke que le blob enveloppé et les URL de cérémonie — jamais les octets de part.',
+        items: [
+          { label: 'Seuil n / total m', text: 'Configurer combien de parts doivent se connecter et combien de dépositaires détiennent des jetons' },
+          { label: 'Affectation des dépositaires', text: 'Associer chaque index de part à un utilisateur UCM avec contribute:hsm ; write:hsm gère la liste' },
+          { label: 'Fenêtre de signature', text: 'Un opérateur ouvre une fenêtre pour les actions racine uniquement. Les protocoles (ACME, SCEP, EST, WSTEP) restent refusés tant que ca.offline est défini' },
+          { label: 'ram-client', text: 'Chaque dépositaire ne voit que sa propre commande ponctuelle et le statut : en attente, connecté ou contribué' },
+          { label: 'Vérifier le jeton', text: 'Lit l’état du domaine de clés et la présence du fichier de part CF01. SW=6A82 signifie que la carte a répondu et n’a pas encore ce fichier' },
+          { label: 'Réinitialiser l’appareil', text: 'Identique à Initialize device de CardContact. Efface toutes les clés et fichiers et fixe un schéma : parts DKEK (à utiliser ici), DKEK aléatoire, pas de DKEK, ou domaines de clés. Le SO-PIN est le code d’initialisation actuel. Saisir DELETE. N’écrit pas de parts' },
+          { label: 'Préparer le jeton', text: 'Supprime le fichier de part et le domaine sur une carte qui a déjà un domaine de parts. Saisir DELETE' },
+          { label: 'Créer la clé racine', text: 'Première cérémonie. Tous les dépositaires doivent être connectés. Génère la clé, écrit une part sur chaque jeton et stocke la racine enveloppée. Saisir DELETE' },
+          { label: "Appareil d'assemblage", text: 'Fenêtre suivante. Lit les parts déjà présentes. Tout seuil de détenteurs présents peut assembler ; le jeton utilisé la fois précédente n’est pas obligatoire. n sur n est bloqué si un jeton manque' },
+          { label: "CRL avant effacement", text: "L'effacement est bloqué jusqu'à la régénération de la CRL après le dernier changement ; l'effacement doit être confirmé avant la fermeture" },
+          { label: 'Répondeur OCSP', text: "Si le répondeur délégué expire avant la prochaine cérémonie, la fermeture exige un accusé de réception explicite — pas une fermeture silencieuse" },
         ]
       },
 
@@ -107,6 +126,21 @@ Types de clés pris en charge :
 > 💡 OpenBao est un fork communautaire de HashiCorp Vault. UCM fonctionne avec les deux.
 
 > 💡 Pour le développement, lancez OpenBao en mode dev : \`docker run -d -p 8200:8200 -e BAO_DEV_ROOT_TOKEN_ID=test-token quay.io/openbao/openbao:latest server -dev\`
+
+
+### SmartCard-HSM (distant)
+Racine hors ligne adossée à des jetons USB SmartCard-HSM (\`sc-hsm-cloud\`). Distinct d'AWS CloudHSM.
+
+- **Seuil n / total m** : Combien de parts doivent se connecter et combien de dépositaires détiennent des jetons
+- **Dépositaires** : Chaque index de part est associé à un utilisateur UCM (\`contribute:hsm\` rejoint ; \`write:hsm\` gère la liste)
+- **Fenêtre de signature** : L'opérateur ouvre une fenêtre pour les actions racine. Les protocoles restent refusés ; \`ca.offline\` reste défini
+- **ram-client** : Chaque dépositaire exécute une commande ponctuelle qui lui est montrée uniquement ; statut en attente, connecté ou contribué
+- **Prêt** : Initialisé pour des parts DKEK, domaine vide, pas de fichier \`CF01\`. **Vérifier le jeton** le lit. \`SW=6A82\` signifie que le fichier de part n’est pas encore là
+- **Réinitialiser l’appareil** : Identique à Initialize device de CardContact. Efface clés et fichiers et fixe un schéma (pour UCM : parts DKEK). Le SO-PIN est le code actuel. Saisir \`DELETE\`. \`SW=6982\` : SO-PIN incorrect. \`SW=6A80\` : données refusées. \`SW=6D00\` : pas de domaine de parts
+- **Créer la clé racine** : Première cérémonie, les \`m\` jetons connectés. Écrit la première part. **Appareil d’assemblage** ne lit que des parts déjà présentes. À la fenêtre suivante, tout seuil présent suffit ; n sur n exige tous les jetons
+- **Appareil d'assemblage** : Un jeton connecté reconstruit la clé racine ; UCM ne voit jamais la clé en clair ni les octets de part
+- **CRL avant effacement** : L'effacement est bloqué jusqu'à régénération de la CRL ; doit être confirmé avant fermeture
+- **Avertissement OCSP** : Si le répondeur délégué expire avant la prochaine cérémonie, la fermeture exige un accusé de réception explicite
 
 ## Gérer les fournisseurs
 

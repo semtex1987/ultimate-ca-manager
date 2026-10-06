@@ -1,0 +1,56 @@
+[Unit]
+Description=UCM SmartCard-HSM RAM bridge
+Documentation=https://github.com/NeySlim/ultimate-ca-manager
+After=network.target pcscd.service
+Wants=pcscd.service
+Before=ucm.service
+# Backend ships services.hsm.ram_bridge; skip until that module exists.
+ConditionPathExists=/opt/ucm/backend/services/hsm/ram_bridge.py
+
+[Service]
+Type=simple
+User=ucm
+Group=ucm
+WorkingDirectory=/opt/ucm/backend
+
+EnvironmentFile=-/etc/ucm/ucm.env
+Environment=RAM_PORT=8444
+# Optional. Public origin ram-client dials. Unset: admin host plus RAM_PORT.
+# Reverse proxy: UCM_RAM_PUBLIC_URL=https://ucm-api.example.com
+
+# Same process command as docker/entrypoint.sh:
+#   /opt/ucm/venv/bin/python -m services.hsm.ram_bridge
+ExecStart=/opt/ucm/venv/bin/python -m services.hsm.ram_bridge
+
+Restart=on-failure
+RestartSec=5s
+StartLimitInterval=60s
+StartLimitBurst=3
+
+# Unix control socket under data; TLS listener on RAM_PORT
+ReadWritePaths=/opt/ucm/data /var/log/ucm /etc/ucm
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# PC/SC socket access for OpenSC PKCS#11 against vpcd slots
+SupplementaryGroups=pcscd
+
+LimitNOFILE=65536
+LimitNPROC=512
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ucm-ram-bridge
+
+[Install]
+WantedBy=multi-user.target

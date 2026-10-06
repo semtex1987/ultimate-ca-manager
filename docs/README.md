@@ -24,7 +24,7 @@ Technical documentation for Ultimate Certificate Manager.
 
 ## Operations
 
-- **[HSM_DOCKER.md](./HSM_DOCKER.md)**: HSM integration in Docker
+- **[HSM_DOCKER.md](./HSM_DOCKER.md)**: HSM integration in Docker, including the SmartCard-HSM ceremony (reinitialize, first root key, later assembly)
 - **[LOG_ROTATION.md](./LOG_ROTATION.md)**: Log rotation configuration
 - **[REDIS.md](./REDIS.md)**: Optional Redis integration
 - **[TESTING.md](./TESTING.md)**: Testing & linting guide (unit + E2E + ESLint + Ruff)

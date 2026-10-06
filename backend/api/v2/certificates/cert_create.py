@@ -98,7 +98,9 @@ def create_certificate():
         return error_response('CA is awaiting its certificate', 400)
 
     if ca.offline:
-        return error_response('CA is offline; restore it before issuing', 400)
+        from services.hsm.signing_window import operator_offline_blocks
+        if operator_offline_blocks(ca):
+            return error_response('CA is offline; restore it before issuing', 400)
 
     if ca.revoked_in_chain:
         return error_response('CA is revoked and can no longer issue certificates', 400)

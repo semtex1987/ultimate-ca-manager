@@ -26,10 +26,6 @@ from utils.public_endpoints import (
     is_protocol_path,
 )
 
-# The admin UI pages whose names begin with a protocol endpoint's name.
-_ADMIN_PAGES = ('/tsa-config', '/scep-config', '/est-config', '/crl-ocsp', '/acme')
-
-# The protocol endpoints themselves, exactly as the routes declare them.
 _PROTOCOL_PATHS = (
     '/tsa',
     '/ocsp',
@@ -40,9 +36,13 @@ _PROTOCOL_PATHS = (
     '/.well-known/est/cacerts',
     '/.well-known/acme-challenge/token',
     '/ssh/setup/abc',
+    '/hsm/ram/connect-token-example',
     '/ADPolicyProvider_CEP_UsernamePassword/service.svc',
     '/ADCertificateService_CES_Kerberos/service.svc',
 )
+
+# The admin UI pages whose names begin with a protocol endpoint's name.
+_ADMIN_PAGES = ('/tsa-config', '/scep-config', '/est-config', '/crl-ocsp', '/acme', '/hsm')
 
 
 @pytest.fixture
@@ -73,6 +73,15 @@ def test_admin_pages_are_not_protocol_paths():
     """``/tsa-config`` is an admin page, not a timestamping endpoint."""
     for path in _ADMIN_PAGES:
         assert not is_protocol_path(path), f'{path} is an admin UI route'
+
+
+def test_hsm_admin_stays_admin_while_ram_is_protocol():
+    """``/hsm/ram/`` is public protocol; bare ``/hsm`` remains the admin SPA."""
+    assert is_protocol_path('/hsm/ram/abc')
+    assert is_protocol_path('/hsm/ram/')
+    assert not is_protocol_path('/hsm')
+    assert not is_protocol_path('/hsm/')
+    assert is_admin_ui_path('/hsm')
 
 
 def test_tsa_config_is_blocked_on_the_acme_vhost(split_topology, app):

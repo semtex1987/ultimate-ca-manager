@@ -81,13 +81,16 @@ function AdminRoute({ children }) {
   return children
 }
 
-function PermissionRoute({ children, permission }) {
+function PermissionRoute({ children, permission, anyOf }) {
   const { isAuthenticated, loading, permissions } = useAuth()
   
   if (loading) return <PageLoader />
   if (!isAuthenticated) return <Navigate to="/login" replace />
   if (permissions?.includes('*')) return children
-  if (permission && !permissions?.includes(permission)) return <Navigate to="/" replace />
+  const allowed = anyOf || (permission ? [permission] : [])
+  if (allowed.length && !allowed.some((p) => permissions?.includes(p))) {
+    return <Navigate to="/" replace />
+  }
   
   return children
 }
@@ -157,7 +160,7 @@ function AppRoutes() {
           <Route path="/groups" element={<Navigate to="/users?tab=groups" replace />} />
           <Route path="/rbac" element={<AdminRoute><RBACPage /></AdminRoute>} />
           <Route path="/sso" element={<Navigate to="/settings?tab=sso" replace />} />
-          <Route path="/hsm" element={<PermissionRoute permission="read:hsm"><HSMPage /></PermissionRoute>} />
+          <Route path="/hsm" element={<PermissionRoute anyOf={['read:hsm', 'contribute:hsm']}><HSMPage /></PermissionRoute>} />
           <Route path="/security" element={<Navigate to="/settings?tab=security" replace />} />
           {/* Governance */}
           <Route path="/policies" element={<PermissionRoute permission="read:policies"><PoliciesPage /></PermissionRoute>} />
