@@ -113,3 +113,13 @@ SECURITY_AUDIT.md
 .env.lab
 .env*.local
 CHANGELOG.md.tmp
+
+# OpenMemory - IDE/Assistant specific rules
+.cursor/rules/openmemory.mdc
+
+# Snipara MCP config (contains API key)
+.mcp.json
+
+# Snipara generated validation output
+.snipara/companion/doctor.json
+AGENTS.md
