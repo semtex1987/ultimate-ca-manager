@@ -87,6 +87,7 @@ class ScHsmCloudProvider(BaseHsmProvider):
         self.socket_path = config.get('socket_path') or os.getenv(
             'RAM_BRIDGE_SOCK', DEFAULT_SOCK,
         )
+        self.provider_id = config.get('_provider_id')
         if self.threshold_n and self.total_m and self.threshold_n > self.total_m:
             raise HsmConfigError('threshold_n cannot exceed total_m')
 
@@ -144,6 +145,13 @@ class ScHsmCloudProvider(BaseHsmProvider):
         except HsmConnectionError:
             return False
         ceremony = status.get('ceremony') or {}
+        if (
+            self.provider_id is not None
+            and ceremony.get('provider_id') is not None
+            and str(ceremony.get('provider_id')) != str(self.provider_id)
+        ):
+            # The bridge has one window; it belongs to another provider.
+            return False
         return bool(ceremony.get('active') and ceremony.get('key_assembled'))
 
     def begin_ceremony(self, params: dict) -> dict:
@@ -257,6 +265,7 @@ class ScHsmCloudProvider(BaseHsmProvider):
             'key_identifier': key_identifier,
             'algorithm': algorithm,
             'hash_algorithm': hash_algorithm or 'sha256',
+            'provider_id': self.provider_id,
         })
         if not result.get('ok'):
             raise HsmOperationError(result.get('error') or 'sign failed')

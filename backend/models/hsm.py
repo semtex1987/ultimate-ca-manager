@@ -25,6 +25,7 @@ _SENSITIVE_KEYS = frozenset({
     'secret', 'client_secret',
     'token',                       # openbao token (NOT token_label)
     'connect_token',               # sc-hsm-cloud custodian ceremony URL token
+    'root_connect_token',          # sc-hsm-cloud root HSM slot URL token (pka)
     'wrapped_root',                # DKEK-wrapped root blob
     'wrapped_root_blob',
     'service_account_json',        # gcp — contains private_key

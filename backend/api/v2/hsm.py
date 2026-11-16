@@ -204,25 +204,40 @@ def ceremony_begin(provider_id):
         return error_response('Provider not found', 404)
     if provider.type != 'sc-hsm-cloud':
         return error_response('Ceremony is only available for sc-hsm-cloud providers', 400)
+    body = request.get_json(silent=True) or {}
     try:
         from services.hsm.ceremony_service import begin_ceremony, detail_dict
-        begin_ceremony(provider)
+        user_id, username = _audit_user()
+        opened = begin_ceremony(
+            provider,
+            operations=body.get('operations'),
+            max_signatures=body.get('max_signatures'),
+            ttl_hours=body.get('ttl_hours'),
+            opened_by=username or '',
+        )
         data = detail_dict(
             provider,
             viewer_user_id=_current_user_id(),
             viewer_can_write_hsm=True,
             viewer_can_contribute_hsm=True,
         )
+        details = f'Signing window opened for {provider.name}'
+        if opened.get('ceremony_id'):
+            details += f"; ceremony {opened['ceremony_id']} manifest_sha256={opened.get('manifest_sha256')}"
         AuditService.log_action(
             action='hsm_ceremony_begin',
             resource_type='hsm_provider',
             resource_id=provider_id,
             resource_name=provider.name,
-            details=f'Signing window opened for {provider.name}',
+            details=details,
             success=True,
+            user_id=user_id,
+            username=username,
         )
         return success_response(data=data, message='Signing window opened')
     except ValueError as e:
+        return error_response(str(e), 400)
+    except HsmOperationError as e:
         return error_response(str(e), 400)
     except Exception as e:
         logger.exception('ceremony begin failed')
@@ -540,14 +555,20 @@ def ceremony_end(provider_id):
     try:
         from services.hsm.ceremony_service import end_ceremony, detail_dict
         from services.hsm.base_provider import HsmOperationError
-        end_ceremony(provider)
+        ended = end_ceremony(provider)
+        user_id, username = _audit_user()
+        details = 'Signing window closed'
+        if ended.get('transcript_final_hash'):
+            details += f"; ceremony {ended.get('ceremony_id')} transcript_sha256={ended['transcript_final_hash']}"
         AuditService.log_action(
             action='hsm_ceremony_end',
             resource_type='hsm_provider',
             resource_id=provider_id,
             resource_name=provider.name,
-            details='Signing window closed',
+            details=details,
             success=True,
+            user_id=user_id,
+            username=username,
         )
         return success_response(
             data=detail_dict(
@@ -563,6 +584,256 @@ def ceremony_end(provider_id):
     except Exception as e:
         logger.exception('ceremony end failed')
         return error_response(str(e) or 'Failed to end ceremony', 500)
+
+
+# -----------------------------------------------------------------------------
+# Public key authentication ceremony (device_scheme = 'pka')
+# docs/design/sc-hsm-remote-ceremony-pka.md
+# -----------------------------------------------------------------------------
+
+MAX_PKA_EXPORT_BYTES = 8192
+
+
+def _pka_provider(provider_id):
+    """Return (provider, None) or (None, error_response)."""
+    provider = HsmService.get_provider(provider_id)
+    if not provider:
+        return None, error_response('Provider not found', 404)
+    from services.hsm.ceremony_service import is_pka
+    if not is_pka(provider):
+        return None, error_response('This action needs a public key authentication (pka) provider', 400)
+    return provider, None
+
+
+def _require_keyholder_perm():
+    perms = getattr(g, 'permissions', None) or []
+    if '*' in perms or has_permission('contribute:hsm', perms) or has_permission('write:hsm', perms):
+        return None
+    return error_response('Permission required: contribute:hsm', 403)
+
+
+def _pka_errors(fn):
+    """Map service errors to HTTP answers for the keyholder routes."""
+    from functools import wraps
+    from services.hsm.sc_hsm_pka import PkaError
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except PermissionError as e:
+            return error_response(str(e), 403)
+        except (ValueError, PkaError, HsmOperationError) as e:
+            return error_response(str(e), 400)
+        except HsmConnectionError as e:
+            return error_response(f'RAM bridge unavailable: {e}', 503)
+    return wrapper
+
+
+def _audit_pka(provider, action, details, success=True):
+    user_id, username = _audit_user()
+    AuditService.log_action(
+        action=action,
+        resource_type='hsm_provider',
+        resource_id=provider.id,
+        resource_name=provider.name,
+        details=details,
+        success=success,
+        user_id=user_id,
+        username=username,
+    )
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/keyholder/enroll', methods=['POST'])
+@require_auth()
+@_pka_errors
+def ceremony_keyholder_enroll(provider_id):
+    """Upload the caller's own ``sc-hsm-tool --export-for-pub-key-auth`` file."""
+    denied = _require_keyholder_perm()
+    if denied is not None:
+        return denied
+    provider, error = _pka_provider(provider_id)
+    if error is not None:
+        return error
+    import base64
+    body = request.get_json(silent=True) or {}
+    try:
+        export = base64.b64decode(body.get('export_b64') or '', validate=True)
+    except (ValueError, TypeError):
+        return error_response('export_b64 is not valid base64', 400)
+    if not export or len(export) > MAX_PKA_EXPORT_BYTES:
+        return error_response('export file is empty or too large', 400)
+    from services.hsm.ceremony_service import enroll_keyholder
+    summary = enroll_keyholder(provider, _current_user_id(), export)
+    _audit_pka(
+        provider, 'hsm_keyholder_enroll',
+        f"slot {summary['share_index']} enrolled key {summary['chr']} "
+        f"device {summary['device_chr']} sha256={summary['fingerprint']}",
+    )
+    return success_response(data=summary, message='Key enrolled')
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/registration-bundle', methods=['GET'])
+@require_auth(['write:hsm'])
+@_pka_errors
+def ceremony_registration_bundle(provider_id):
+    """Zip of keyholder exports for ``sc-hsm-tool --register-public-key`` at the HSM site."""
+    provider, error = _pka_provider(provider_id)
+    if error is not None:
+        return error
+    from flask import Response
+    from services.hsm.ceremony_service import registration_bundle
+    bundle = registration_bundle(provider)
+    _audit_pka(provider, 'hsm_registration_bundle', 'registration bundle downloaded')
+    return Response(
+        bundle,
+        mimetype='application/zip',
+        headers={'Content-Disposition': f'attachment; filename="ucm-provider-{provider.id}-keyholders.zip"'},
+    )
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/pin-device', methods=['POST'])
+@require_auth(['write:hsm'])
+@_pka_errors
+def ceremony_pin_device(provider_id):
+    """Pin the connected root HSM after its device reference was confirmed on the call."""
+    provider, error = _pka_provider(provider_id)
+    if error is not None:
+        return error
+    body = request.get_json(silent=True) or {}
+    from services.hsm.ceremony_service import detail_dict, pin_root_device
+    pinned = pin_root_device(provider, body.get('device_chr') or '')
+    _audit_pka(provider, 'hsm_root_device_pinned', f"root HSM device {pinned['pinned_device_chr']} pinned")
+    return success_response(data=detail_dict(
+        provider, viewer_user_id=_current_user_id(),
+        viewer_can_write_hsm=True, viewer_can_contribute_hsm=True,
+    ))
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/keyholder', methods=['GET'])
+@require_auth()
+@_pka_errors
+def ceremony_keyholder_context(provider_id):
+    """What the caller's keyholder agent shows before approving."""
+    denied = _require_keyholder_perm()
+    if denied is not None:
+        return denied
+    provider, error = _pka_provider(provider_id)
+    if error is not None:
+        return error
+    from services.hsm.ceremony_service import keyholder_context
+    return success_response(data=keyholder_context(provider, _current_user_id()))
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/keyholder/approve', methods=['POST'])
+@require_auth()
+@_pka_errors
+def ceremony_keyholder_approve(provider_id):
+    denied = _require_keyholder_perm()
+    if denied is not None:
+        return denied
+    provider, error = _pka_provider(provider_id)
+    if error is not None:
+        return error
+    body = request.get_json(silent=True) or {}
+    from services.hsm.ceremony_service import keyholder_approve
+    result = keyholder_approve(provider, _current_user_id(), body.get('signature_b64') or '')
+    manifest_hash = ((result.get('pka') or {}).get('manifest_sha256'))
+    _audit_pka(provider, 'hsm_keyholder_approve', f'manifest sha256={manifest_hash} approved')
+    return success_response(data={'approved': True, 'manifest_sha256': manifest_hash})
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/keyholder/challenge', methods=['POST'])
+@require_auth()
+@_pka_errors
+def ceremony_keyholder_challenge(provider_id):
+    denied = _require_keyholder_perm()
+    if denied is not None:
+        return denied
+    provider, error = _pka_provider(provider_id)
+    if error is not None:
+        return error
+    from services.hsm.ceremony_service import keyholder_challenge
+    return success_response(data=keyholder_challenge(provider, _current_user_id()))
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/keyholder/authenticate', methods=['POST'])
+@require_auth()
+@_pka_errors
+def ceremony_keyholder_authenticate(provider_id):
+    denied = _require_keyholder_perm()
+    if denied is not None:
+        return denied
+    provider, error = _pka_provider(provider_id)
+    if error is not None:
+        return error
+    body = request.get_json(silent=True) or {}
+    from services.hsm.ceremony_service import keyholder_authenticate
+    try:
+        result = keyholder_authenticate(provider, _current_user_id(), body.get('signature_b64') or '')
+    except (ValueError, HsmOperationError) as e:
+        _audit_pka(provider, 'hsm_keyholder_authenticate', f'refused: {e}', success=False)
+        raise
+    _audit_pka(
+        provider, 'hsm_keyholder_authenticate',
+        f"authenticated {result.get('authenticated')}/{result.get('required')} unlocked={result.get('unlocked')}",
+    )
+    return success_response(data=result)
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/generate-root-key', methods=['POST'])
+@require_auth(['write:hsm'])
+@_pka_errors
+def ceremony_generate_root_key(provider_id):
+    """Generate the root key inside the unlocked root HSM. Body: confirm GENERATE."""
+    provider, error = _pka_provider(provider_id)
+    if error is not None:
+        return error
+    body = request.get_json(silent=True) or {}
+    from services.hsm.ceremony_service import detail_dict, generate_pka_root_key
+    created = generate_pka_root_key(provider, body.get('confirm') or '', int(body.get('bits') or 2048))
+    _audit_pka(provider, 'hsm_ceremony_create_key', f"root key generated in HSM; public key sha256={created['public_key_sha256']}")
+    data = detail_dict(
+        provider, viewer_user_id=_current_user_id(),
+        viewer_can_write_hsm=True, viewer_can_contribute_hsm=True,
+    )
+    data['public_key_pem'] = created['public_key_pem']
+    return success_response(data=data, message='Root key generated')
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/transcript', methods=['GET'])
+@require_auth()
+@_pka_errors
+def ceremony_transcript(provider_id):
+    perms = getattr(g, 'permissions', None) or []
+    if '*' not in perms and not (
+        has_permission('read:hsm', perms) or has_permission('contribute:hsm', perms)
+    ):
+        return error_response('Permission required: read:hsm or contribute:hsm', 403)
+    provider, error = _pka_provider(provider_id)
+    if error is not None:
+        return error
+    from services.hsm.ceremony_service import get_transcript
+    return success_response(data=get_transcript(provider, request.args.get('ceremony_id') or None))
+
+
+@bp.route('/api/v2/hsm/providers/<int:provider_id>/ceremony/transcript/countersign', methods=['POST'])
+@require_auth()
+@_pka_errors
+def ceremony_transcript_countersign(provider_id):
+    denied = _require_keyholder_perm()
+    if denied is not None:
+        return denied
+    provider, error = _pka_provider(provider_id)
+    if error is not None:
+        return error
+    body = request.get_json(silent=True) or {}
+    from services.hsm.ceremony_service import countersign_transcript
+    result = countersign_transcript(
+        provider, _current_user_id(), str(body.get('ceremony_id') or ''), body.get('signature_b64') or '',
+    )
+    _audit_pka(provider, 'hsm_transcript_countersign', f"transcript sha256={result['final_hash']} countersigned")
+    return success_response(data=result)
 
 
 @bp.route('/api/v2/hsm/providers/<int:provider_id>', methods=['PUT'])
@@ -616,8 +887,12 @@ def update_provider(provider_id):
         )
         
         return success_response(data=updated.to_dict(include_config=True))
-        
+
     except ValueError as e:
+        from services.hsm.ceremony_service import CeremonyBindingError
+        if isinstance(e, CeremonyBindingError):
+            # Fixed text from the ceremony rules; it carries no secret.
+            return error_response(str(e), 400)
         logger.warning(f"HSM provider update validation error: {e}")
         return error_response('Invalid provider configuration', 400)
     except Exception as e:

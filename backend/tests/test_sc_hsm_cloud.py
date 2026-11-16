@@ -17,6 +17,13 @@ from services.hsm.sc_hsm_cloud_provider import ScHsmCloudProvider, call_bridge
 from services.hsm import HsmService
 
 
+@pytest.fixture(autouse=True)
+def _legacy_share_mode(monkeypatch):
+    """These tests cover the legacy share scheme, which is opt-in, over plain HTTP."""
+    monkeypatch.setenv('UCM_ALLOW_LEGACY_SHARE_CEREMONY', '1')
+    monkeypatch.setenv('RAM_BRIDGE_ALLOW_PLAINTEXT', '1')
+
+
 @pytest.fixture
 def bridge_sock():
     # AF_UNIX paths on macOS are capped (~104 bytes); keep the socket short.
@@ -155,13 +162,12 @@ def test_create_sc_hsm_provider_with_custodians(auth_client, app):
     assert 'ocsp_responder_warning' in d
     assert isinstance(d['custodians'], list)
     assert len(d['custodians']) == 2
-    # write:hsm sees URLs
+    # An operator does not see another custodian's connect URL: holding every
+    # URL would let one person fill every slot.
     c0 = d['custodians'][0]
-    assert c0.get('ram_client_url')
-    assert 'hsm/ram/' in c0['ram_client_url']
+    assert 'ram_client_url' not in c0
     assert d['ram_public']['origin']
     assert d['ram_public']['mode'] in ('dedicated', 'direct_port')
-    assert c0['ram_client_url'].startswith(d['ram_public']['origin'])
     assert c0['user_id'] == uid
     assert c0['share_index'] in (1, 2)
     assert c0['status'] in ('waiting', 'connected', 'contributed')
@@ -793,6 +799,89 @@ def test_create_root_key_writes_the_first_share(auth_client, app, bridge_sock, m
     assert 'already assembled' in (again.get_json().get('message') or '').lower()
 
 
+def test_random_dkek_create_does_not_replace_the_device_key(auth_client, app, bridge_sock, monkeypatch):
+    """A completed random DKEK is the key-generation state, not a share domain."""
+    monkeypatch.setenv('RAM_BRIDGE_SOCK', bridge_sock.sock_path)
+    with app.app_context():
+        user = User(username='random-holder', email='random@example.com', role='operator')
+        user.set_password('TestPass123!')
+        db.session.add(user)
+        db.session.commit()
+        uid = user.id
+    create = auth_client.post('/api/v2/hsm/providers', json={
+        'name': 'Random DKEK',
+        'type': 'sc-hsm-cloud',
+        'config': {
+            'token_label': 'random',
+            'device_scheme': 'random',
+            'threshold_n': 1,
+            'total_m': 1,
+            'custodians': [{'user_id': uid, 'share_index': 1}],
+        },
+    })
+    assert create.status_code in (200, 201), create.get_json()
+    pid = (create.get_json().get('data') or create.get_json())['id']
+    begin = auth_client.post(f'/api/v2/hsm/providers/{pid}/ceremony/begin')
+    assert begin.status_code == 200, begin.get_json()
+    custodian_id = str((begin.get_json().get('data') or begin.get_json())['custodians'][0]['id'])
+    assert call_bridge(
+        'connect_fake',
+        {'custodian_id': custodian_id},
+        sock_path=bridge_sock.sock_path,
+    )['ok']
+
+    inspected = auth_client.post(
+        f'/api/v2/hsm/providers/{pid}/ceremony/tokens/{custodian_id}/inspect',
+    )
+    card = (inspected.get_json().get('data') or inspected.get_json())['card']
+    assert card['state'] == 'has_dkek'
+    assert card['ready'] is False
+
+    left_alone = auth_client.post(
+        f'/api/v2/hsm/providers/{pid}/ceremony/tokens/{custodian_id}/prepare',
+        json={},
+    )
+    assert left_alone.status_code == 200, left_alone.get_json()
+    assert (left_alone.get_json().get('data') or left_alone.get_json())['already_ready'] is True
+    assert len(bridge_sock.ceremony.custodian_cards[custodian_id].copy_share()) == 0
+
+    bridge_sock.ceremony.custodian_cards[custodian_id].replace_share(b'\x11' * 32)
+    refused = auth_client.post(
+        f'/api/v2/hsm/providers/{pid}/ceremony/tokens/{custodian_id}/prepare',
+        json={'confirm': 'DELETE'},
+    )
+    assert refused.status_code == 400, refused.get_json()
+    assert 'random DKEK' in (refused.get_json().get('message') or '')
+    assert len(bridge_sock.ceremony.custodian_cards[custodian_id].copy_share()) == 32
+
+    reinitialized = auth_client.post(
+        f'/api/v2/hsm/providers/{pid}/ceremony/tokens/{custodian_id}/prepare',
+        json={
+            'confirm': 'DELETE',
+            'reinitialize': True,
+            'so_pin': '0011223344556677',
+            'user_pin': '654321',
+        },
+    )
+    assert reinitialized.status_code == 200, reinitialized.get_json()
+    again = (reinitialized.get_json().get('data') or reinitialized.get_json())['card']
+    assert again['state'] == 'has_dkek'
+    assert len(bridge_sock.ceremony.custodian_cards[custodian_id].copy_share()) == 0
+
+    created_key = auth_client.post(
+        f'/api/v2/hsm/providers/{pid}/ceremony/create-key',
+        json={'share_index': 1, 'confirm': 'DELETE', 'user_pin': '654321'},
+    )
+    assert created_key.status_code == 200, created_key.get_json()
+    data = created_key.get_json().get('data') or created_key.get_json()
+    assert data['key_assembled'] is True
+    assert len(bridge_sock.ceremony.custodian_cards[custodian_id].copy_share()) == 0
+    with app.app_context():
+        provider = db.session.get(HsmProvider, pid)
+        assert provider.get_config().get('wrapped_root')
+        assert provider.get_config().get('device_scheme') == 'random'
+
+
 def test_missing_assembly_card_uses_present_custodian_pin(bridge_sock, monkeypatch, caplog):
     """The last assembly card can be absent when the threshold is still met.
 
@@ -1018,6 +1107,28 @@ def test_reset_removes_existing_key_before_clearing_dkek(bridge_sock):
     bridge_sock._reset_assembly_domain(1)
     assert [apdu[1] for apdu in seen] == [0x52, 0x52, 0xE4, 0x52]
     assert seen[2][5:7] == b'\xCC\x01'
+
+
+def test_pkcs11_uses_the_only_connected_card_before_assembly_is_chosen():
+    """A single connected card is the PKCS#11 token before assembly is picked."""
+    bridge = RamBridge(
+        ram_port=0,
+        sock_path='/tmp/ucm-pkcs11-atr-test.sock',
+        bind_host='127.0.0.1',
+        vpcd_port=1,
+    )
+    bridge.ceremony.use_fake = False
+    atr = bytes.fromhex('3BFE1800008131FE458031815448534D')
+    bridge.sessions.register_slot('12', 'tok-12')
+    bridge.sessions.get_by_custodian('12').mark_connected(atr)
+    assert bridge._pkcs11_session().custodian_id == '12'
+    assert bridge._live_pkcs11_atr() == atr
+
+    bridge.sessions.register_slot('13', 'tok-13')
+    bridge.sessions.get_by_custodian('13').mark_connected(atr)
+    assert bridge._pkcs11_session() is None
+    bridge.ceremony.assembly_custodian_id = '13'
+    assert bridge._pkcs11_session().custodian_id == '13'
 
 
 def test_reset_keeps_an_empty_domain_when_clear_returns_6985(bridge_sock):

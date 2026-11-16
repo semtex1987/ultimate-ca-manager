@@ -150,6 +150,7 @@ class VpcdClient:
         self.reconnect_delay = reconnect_delay
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._immediate = threading.Event()
         self._sock: Optional[socket.socket] = None
 
     @property
@@ -165,6 +166,21 @@ class VpcdClient:
         )
         self._thread.start()
         logger.info('vpicc client targeting vpcd at %s:%s', self.host, self.port)
+
+    def bounce(self) -> None:
+        """Drop the current connection so the next card is built immediately."""
+        self._immediate.set()
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def stop(self) -> None:
         self._stop.set()
@@ -208,5 +224,7 @@ class VpcdClient:
                     sock.close()
                 except OSError:
                     pass
-            if not self._stop.is_set():
+            if self._immediate.is_set():
+                self._immediate.clear()
+            elif not self._stop.is_set():
                 self._stop.wait(self.reconnect_delay)

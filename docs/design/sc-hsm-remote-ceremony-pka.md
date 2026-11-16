@@ -141,6 +141,8 @@ Routine ceremonies never move key material. Backup is the one place it must move
 
 UCM's legacy share mode is not a backup mechanism and stays disabled by default (section 10).
 
+A UCM backup carries the provider's configuration and its keyholder roster (`hsm_custodians`): the slot, the user and the public key each keyholder enrolled, which is what the root HSM was registered with. It does not carry the per-window connect token, a bearer credential; a restore issues a new one for a keyholder it creates and leaves an existing keyholder's token alone. Nothing in a UCM backup can authenticate to the root HSM: that still takes n keyholder cards.
+
 ## 7. Keyholder identity and attestation controls
 
 | Layer | Control | Evidence kept |
@@ -155,6 +157,8 @@ UCM's legacy share mode is not a backup mechanism and stays disabled by default 
 | After the fact | Hash-chained transcript; keyholder countersignatures | Stored transcript, audit log entry with final hash |
 
 The SAS includes the SHA-256 of the server TLS certificate's SubjectPublicKeyInfo, as the agent saw it. If a TLS-intercepting proxy sits in front of a keyholder, that keyholder's SAS differs from the operator's. Behind a reverse proxy, set `UCM_PUBLIC_TLS_SPKI_SHA256` to the proxy certificate's SPKI hash so both sides use the same input.
+
+The keyholder agent is the one piece of software a keyholder has to trust: it shows the plan they approve and the SAS they read aloud, and it drives their card. A keyholder must not fetch it from the UCM server they are about to authenticate to, since whoever controls that server could serve an agent that shows one plan and signs another. Distribute it from the source repository at a tagged release, and publish its SHA-256 through a channel UCM does not control (the ceremony invitation, the enrollment call). `ucm_keyholder.py --version` prints the agent's own SHA-256 so each keyholder can read it aloud and compare it on the call.
 
 ## 8. Protocol details
 
@@ -244,6 +248,31 @@ Residual (accepted, mitigated by procedure):
 | 5 | Keyholder agent | `tools/keyholder/ucm_keyholder.py`, `tools/keyholder/README.md` | Unit tests of message construction and transcript verification |
 | 6 | HSM page: PKA scheme, enrollment, quorum status, manifest entry, SAS, generate, lock, transcript | `HSMPage.jsx`, `hsm.service.js`, `en.json` | Existing page tests pass; new strings fall back to English in other locales |
 | 7 | Operator documentation | `docs/HSM_DOCKER.md` | — |
+
+### 12.1 Implementation status
+
+All phases are implemented on this branch and covered by software tests against `FakePkaRootHsm`, a software root HSM that verifies keyholder signatures:
+
+* `backend/services/hsm/sc_hsm_pka.py`, `backend/services/hsm/pka_engine.py`: protocol module and bridge engine.
+* `backend/services/hsm/ram_bridge.py`, `ceremony_service.py`, `api/v2/hsm.py`: bridge integration, hardening, service and API.
+* `tools/keyholder/`: keyholder agent.
+* `frontend/src/pages/hsm/PkaCeremonyPanel.jsx`: HSM page.
+* Tests: `test_sc_hsm_pka.py`, `test_sc_hsm_pka_ceremony.py`, `test_keyholder_agent.py`, `PkaCeremonyPanel.test.jsx`.
+
+Decided during implementation:
+
+* Root HSM initialization and keyholder key registration run locally at the HSM site with `sc-hsm-tool`, from the registration bundle UCM produces. Remote registration would need the root HSM's user PIN to travel through UCM.
+* A window whose quorum was never reached can close without a reachable root HSM. Partial authentication grants nothing, and leftover state is cleared the next time the device attaches. A window that was unlocked must be locked with a confirmed reset.
+* Provider edits cannot set or change `public_key_pem`, `pinned_device_chr`, `keyholders_locked`, `root_connect_token`, `ceremony_manifest` or `transcripts`.
+* Backups include the keyholder roster with public keys and exclude connect tokens (section 6.6).
+* The public path `/hsm/ram/` has its own rate limit bucket at the standard rate: one request per APDU round trip, so a ceremony is a burst of machine traffic that must not share the admin API's quota.
+
+Still open:
+
+* The hardware checklist (section 13) has not been run.
+* The new UI strings are machine translated in the eight non-English locales and need review by native speakers.
+* The design and code need a security review by someone who did not write them.
+* The keyholder agent needs a signed release, or a checksum published through a channel UCM does not control (section 7).
 
 ## 13. Hardware validation checklist (before production)
 

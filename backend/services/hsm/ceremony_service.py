@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import logging
 import os
 import secrets
+import time
+import uuid
+import zipfile
 from typing import Any, Dict, List, Optional
 
 from models import CA, db
@@ -131,6 +136,7 @@ def detail_dict(
     base['assembly_slot'] = cfg.get('assembly_slot')
     base['wipe_confirmed'] = bool(cfg.get('wipe_confirmed'))
     base['key_assembled'] = bool(ceremony.get('key_assembled'))
+    base['has_wrapped_root'] = bool(cfg.get('wrapped_root') or cfg.get('wrapped_root_blob'))
 
     # The bridge is the source of truth. A local flag must not show a window
     # as open when the bridge is down or has not confirmed the ceremony.
@@ -183,6 +189,7 @@ def detail_dict(
     else:
         base['key_fingerprint'] = None
 
+    pka_mode = is_pka(provider)
     custodians_out = []
     for c in provider.custodians.order_by(HsmCustodian.share_index).all():
         username = None
@@ -208,6 +215,7 @@ def detail_dict(
             access = 'waiting'
 
         is_me = viewer_user_id is not None and c.user_id == viewer_user_id
+        enrolled = keyholder_key(c) if pka_mode else None
         entry = {
             'id': c.id,
             'user_id': c.user_id,
@@ -222,13 +230,29 @@ def detail_dict(
             'card_ready': bool(bridge_info.get('card_ready')) if connected else False,
             'is_me': is_me,
         }
-        # Token URL only for that custodian (contribute) or write:hsm operators
-        if viewer_can_write_hsm or (viewer_can_contribute_hsm and is_me):
+        if pka_mode:
+            live = status.get('pka') or {}
+            entry['enrolled'] = enrolled is not None
+            entry['key_fingerprint'] = enrolled.fingerprint if enrolled else None
+            entry['key_chr'] = enrolled.chr if enrolled else None
+            entry['key_device_chr'] = enrolled.device_chr if enrolled else None
+            entry['approved'] = cid in (live.get('approved') or [])
+            entry['authenticated'] = cid in (live.get('authenticated') or [])
+            # Keyholders never connect a card to the bridge in this scheme.
+            entry['status'] = 'enrolled' if enrolled else 'not_enrolled'
+            entry['access'] = 'waiting'
+        elif is_me and (viewer_can_contribute_hsm or viewer_can_write_hsm):
+            # A connect URL admits a card into that custodian's slot. Only the
+            # custodian sees it; an operator holding every URL could fill
+            # every slot alone.
             entry['ram_client_url'] = c.ram_client_url()
-        _log_custodian_access(provider.id, entry)
+        if not pka_mode:
+            _log_custodian_access(provider.id, entry)
         custodians_out.append(entry)
 
     base['custodians'] = custodians_out
+    if pka_mode:
+        base['pka'] = _pka_detail(provider, cfg, status, viewer_can_write_hsm=viewer_can_write_hsm)
     return base
 
 
@@ -317,9 +341,26 @@ def _responder_expiry_warning(ca) -> Optional[dict]:
     return None
 
 
-def begin_ceremony(provider: HsmProvider) -> dict:
+def begin_ceremony(
+    provider: HsmProvider,
+    *,
+    operations: Optional[list] = None,
+    max_signatures: Any = None,
+    ttl_hours: Any = None,
+    opened_by: Optional[str] = None,
+) -> dict:
     if provider.type != 'sc-hsm-cloud':
         raise ValueError('Not an sc-hsm-cloud provider')
+    if is_pka(provider):
+        return begin_pka_ceremony(
+            provider,
+            operations=operations,
+            max_signatures=max_signatures,
+            ttl_hours=ttl_hours,
+            opened_by=opened_by,
+        )
+    if not legacy_share_ceremony_allowed():
+        raise ValueError(LEGACY_REFUSAL)
     cfg = provider.get_config()
     custodians = []
     for c in provider.custodians.order_by(HsmCustodian.share_index).all():
@@ -335,6 +376,7 @@ def begin_ceremony(provider: HsmProvider) -> dict:
     use_fake = os.getenv('RAM_BRIDGE_FAKE', '').strip().lower() in ('1', 'true', 'yes')
     params = {
         'provider_id': provider.id,
+        'device_scheme': (cfg.get('device_scheme') or 'shares'),
         'threshold_n': int(cfg.get('threshold_n') or len(custodians)),
         'total_m': int(cfg.get('total_m') or len(custodians)),
         'custodians': custodians,
@@ -370,6 +412,7 @@ def set_assembly_slot(provider: HsmProvider, share_index: int, *, user_pin: str 
     result = call_bridge('set_assembly', {
         'assembly_custodian_id': str(custodian.id),
         'user_pin': user_pin or '',
+        'device_scheme': provider.get_config().get('device_scheme') or 'shares',
     }, sock_path=_sock(provider))
     if not result.get('ok'):
         raise HsmOperationError(result.get('error') or 'set_assembly failed')
@@ -583,6 +626,9 @@ def end_ceremony(provider: HsmProvider) -> dict:
     if not result.get('ok'):
         raise HsmOperationError(result.get('error') or 'end_ceremony failed')
 
+    transcript = result.get('transcript')
+    if transcript:
+        _store_transcript(provider, transcript)
     _set_ceremony_flags(
         provider,
         ceremony_active=False,
@@ -590,10 +636,16 @@ def end_ceremony(provider: HsmProvider) -> dict:
         assembly_slot=None,
         ocsp_acknowledged=False,
         crl_stale=False,
+        ceremony_manifest=None,
     )
+    _rotate_connect_tokens(provider)
     provider.status = 'offline'
     db.session.commit()
-    return {'ok': True}
+    out = {'ok': True}
+    if transcript:
+        out['transcript_final_hash'] = transcript.get('final_hash')
+        out['ceremony_id'] = transcript.get('ceremony_id')
+    return out
 
 
 def ensure_ceremony_key(provider: HsmProvider) -> Optional[HsmKey]:
@@ -679,8 +731,11 @@ def create_root_key(provider: HsmProvider, share_index: int, confirm: str, *, us
     """Generate the first root key and write a share onto every custodian token."""
     if provider.type != 'sc-hsm-cloud':
         raise ValueError('Not an sc-hsm-cloud provider')
-    if (provider.get_config().get('device_scheme') or 'shares') != 'shares':
-        raise ValueError('Create root key applies to an n-of-m DKEK share provider')
+    if is_pka(provider):
+        raise ValueError('A pka provider generates its root key with generate-root-key during an unlocked window')
+    scheme = provider.get_config().get('device_scheme') or 'shares'
+    if scheme not in ('shares', 'random'):
+        raise ValueError('Create root key applies to an n-of-m DKEK share provider or a random DKEK')
     if confirm != 'DELETE':
         raise HsmOperationError('Type DELETE to create the root key')
     custodian = (
@@ -694,6 +749,7 @@ def create_root_key(provider: HsmProvider, share_index: int, confirm: str, *, us
         'assembly_custodian_id': str(custodian.id),
         'confirm': confirm,
         'user_pin': user_pin or '',
+        'device_scheme': scheme,
     }, sock_path=_sock(provider))
     if not result.get('ok'):
         raise HsmOperationError(result.get('error') or 'create_root_key failed')
@@ -709,8 +765,14 @@ def roll_root_key(provider: HsmProvider, *, user_pin: str = '') -> dict:
     """
     if provider.type != 'sc-hsm-cloud':
         raise ValueError('Not an sc-hsm-cloud provider')
+    if is_pka(provider):
+        raise HsmOperationError(
+            'A pka root is never re-keyed in place. Create a new provider for the new root '
+            'and cross-certify if relying parties need continuity.'
+        )
     result = call_bridge('roll_root_key', {
         'user_pin': user_pin or '',
+        'device_scheme': provider.get_config().get('device_scheme') or 'shares',
     }, sock_path=_sock(provider))
     if not result.get('ok'):
         raise HsmOperationError(result.get('error') or 'roll_root_key failed')
@@ -772,3 +834,543 @@ def _self_sign_bound_roots(provider: HsmProvider, public_pem: str) -> List[int]:
         ca.serial_number = str(cert.serial_number)
         resigned.append(ca.id)
     return resigned
+
+
+# =============================================================================
+# Public key authentication (device_scheme = 'pka')
+# docs/design/sc-hsm-remote-ceremony-pka.md
+# =============================================================================
+
+LEGACY_REFUSAL = (
+    'Remote DKEK-share ceremonies are disabled: they pass key shares through '
+    'the UCM host. Use a public key authentication (pka) provider, or set '
+    'UCM_ALLOW_LEGACY_SHARE_CEREMONY=1 to accept that risk. '
+    'See docs/design/sc-hsm-remote-ceremony-pka.md.'
+)
+
+# Written only by the ceremony code. A provider edit cannot set or change them.
+SERVER_MANAGED_KEYS = (
+    'public_key_pem',
+    'pinned_device_chr',
+    'keyholders_locked',
+    'root_connect_token',
+    'ceremony_manifest',
+    'transcripts',
+)
+# Bound to the root HSM once its keyholder keys are registered.
+BOUND_KEYS = ('device_scheme', 'threshold_n', 'total_m')
+MAX_STORED_TRANSCRIPTS = 20
+DEFAULT_WINDOW_HOURS = 8
+MAX_WINDOW_HOURS = 72
+
+
+def legacy_share_ceremony_allowed() -> bool:
+    return os.getenv('UCM_ALLOW_LEGACY_SHARE_CEREMONY', '').strip().lower() in ('1', 'true', 'yes')
+
+
+def is_pka(provider: HsmProvider) -> bool:
+    if provider is None or provider.type != 'sc-hsm-cloud':
+        return False
+    return (provider.get_config().get('device_scheme') or '') == 'pka'
+
+
+def protect_ceremony_config(incoming: dict, existing: dict) -> dict:
+    """Keep ceremony-owned config keys out of operator edits."""
+    out = {k: v for k, v in (incoming or {}).items() if k not in SERVER_MANAGED_KEYS}
+    for key in SERVER_MANAGED_KEYS:
+        if key in (existing or {}):
+            out[key] = existing[key]
+    return out
+
+
+class CeremonyBindingError(ValueError):
+    """A provider edit the ceremony state does not allow. Safe to show."""
+
+
+def check_bound_provider_change(provider: HsmProvider, existing: dict, incoming: dict, roster) -> None:
+    """Refuse edits that would no longer match the registered root HSM."""
+    if (existing or {}).get('ceremony_active'):
+        raise CeremonyBindingError('Close the signing window before editing this provider')
+    if (existing or {}).get('device_scheme') != 'pka' or not existing.get('keyholders_locked'):
+        return
+    for key in BOUND_KEYS:
+        if key in incoming and str(incoming.get(key)) != str(existing.get(key)):
+            raise CeremonyBindingError(
+                f'{key} is fixed once keyholder keys are registered on the root HSM; '
+                're-initialize the device and create a new provider to change it'
+            )
+    if roster is not None:
+        current = sorted(
+            (c.share_index, c.user_id) for c in provider.custodians.all()
+        )
+        wanted = sorted(
+            (int(e['share_index']), int(e['user_id']))
+            for e in roster if isinstance(e, dict) and e.get('user_id') is not None
+        )
+        if current != wanted:
+            raise CeremonyBindingError('The keyholder roster is fixed once keys are registered on the root HSM')
+
+
+def keyholder_key(custodian: HsmCustodian):
+    """Parsed enrollment export of a custodian, or None."""
+    from services.hsm import sc_hsm_pka as pka
+    raw = custodian.auth_public_key
+    if not raw:
+        return None
+    try:
+        return pka.parse_pka_export(base64.b64decode(raw))
+    except (ValueError, pka.PkaError):
+        logger.warning('stored keyholder export for custodian %s does not parse', custodian.id)
+        return None
+
+
+def _custodian_for_user(provider: HsmProvider, user_id: Optional[int]) -> HsmCustodian:
+    if user_id is None:
+        raise PermissionError('not signed in')
+    rows = HsmCustodian.query.filter_by(provider_id=provider.id, user_id=int(user_id)).all()
+    if not rows:
+        raise PermissionError('you are not a keyholder of this provider')
+    if len(rows) > 1:
+        # One person must not count twice toward the threshold.
+        raise PermissionError('you hold more than one keyholder slot; fix the roster first')
+    return rows[0]
+
+
+def enroll_keyholder(provider: HsmProvider, user_id: int, export: bytes) -> dict:
+    """Store a keyholder's ``--export-for-pub-key-auth`` file on their own row."""
+    from services.hsm import sc_hsm_pka as pka
+    if not is_pka(provider):
+        raise ValueError('Enrollment applies to a public key authentication provider')
+    cfg = provider.get_config()
+    if cfg.get('keyholders_locked'):
+        raise ValueError('Keyholder keys are already registered on the root HSM; enrollment is closed')
+    if cfg.get('ceremony_active'):
+        raise ValueError('Close the signing window before enrolling')
+    custodian = _custodian_for_user(provider, user_id)
+    key = pka.parse_pka_export(export)
+    for other in provider.custodians.all():
+        if other.id == custodian.id:
+            continue
+        existing = keyholder_key(other)
+        if existing and (existing.fingerprint == key.fingerprint or existing.chr == key.chr):
+            raise ValueError('This key is already enrolled for another keyholder')
+    custodian.auth_public_key = base64.b64encode(export).decode('ascii')
+    db.session.commit()
+    return {'custodian_id': custodian.id, 'share_index': custodian.share_index, **key.summary()}
+
+
+def registration_bundle(provider: HsmProvider) -> bytes:
+    """Zip of every keyholder export, in roster order, for ``sc-hsm-tool`` at the site."""
+    if not is_pka(provider):
+        raise ValueError('Registration applies to a public key authentication provider')
+    cfg = provider.get_config()
+    total = int(cfg.get('total_m') or 0)
+    threshold = int(cfg.get('threshold_n') or 0)
+    rows = provider.custodians.order_by(HsmCustodian.share_index).all()
+    keys = [(row, keyholder_key(row)) for row in rows]
+    missing = [row.share_index for row, key in keys if key is None]
+    if missing or len(rows) != total:
+        raise ValueError(
+            f'All {total} keyholders must be enrolled first; missing slots: {missing or "roster size"}'
+        )
+    lines = [
+        f'UCM provider: {provider.name} (id {provider.id})',
+        f'Threshold: {threshold} of {total}',
+        '',
+        'Run at the root HSM site, with keyholders and a witness on the call:',
+        '',
+        f'  sc-hsm-tool --initialize --so-pin <SO-PIN> --pin <user PIN> \\',
+        f'              --public-key-auth {total} --required-pub-keys {threshold}',
+    ]
+    for index, (row, _key) in enumerate(keys, start=1):
+        lines.append(f'  sc-hsm-tool --register-public-key {index:02d}-slot{row.share_index}.pka --pin <user PIN>')
+    lines += [
+        '  sc-hsm-tool --public-key-auth-status',
+        f'  # expect: total {total}, missing 0, required {threshold}',
+        '',
+        'Each keyholder reads their fingerprint aloud from their own agent; compare:',
+        '',
+    ]
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
+        for index, (row, key) in enumerate(keys, start=1):
+            name = row.user.username if row.user else f'slot{row.share_index}'
+            archive.writestr(f'{index:02d}-slot{row.share_index}.pka', base64.b64decode(row.auth_public_key))
+            lines.append(
+                f'  slot {row.share_index}  {name:<20} key {key.chr:<16} device {key.device_chr:<16} '
+                f'sha256 {key.fingerprint}'
+            )
+        archive.writestr('README.txt', '\n'.join(lines) + '\n')
+    return buffer.getvalue()
+
+
+def server_tls_spki_sha256() -> str:
+    """SHA-256 of the SubjectPublicKeyInfo keyholders see on the UCM HTTPS endpoint.
+
+    Behind a TLS-terminating proxy set UCM_PUBLIC_TLS_SPKI_SHA256 to the
+    proxy certificate's value; otherwise the UCM certificate is used.
+    """
+    override = os.getenv('UCM_PUBLIC_TLS_SPKI_SHA256', '').strip().lower().replace(':', '')
+    if override:
+        return override
+    data_dir = os.getenv('DATA_DIR', '/opt/ucm/data')
+    path = os.getenv('HTTPS_CERT_PATH', os.path.join(data_dir, 'https_cert.pem'))
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        with open(path, 'rb') as handle:
+            cert = x509.load_pem_x509_certificate(handle.read())
+        spki = cert.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return hashlib.sha256(spki).hexdigest()
+    except (OSError, ValueError):
+        return ''
+
+
+def _ceremony_sas(manifest: Optional[dict], device_chr: Optional[str]) -> Optional[str]:
+    from services.hsm import sc_hsm_pka as pka
+    if not manifest or not device_chr:
+        return None
+    return pka.compute_sas(
+        str(manifest.get('ceremony_id')),
+        pka.manifest_hash(manifest),
+        device_chr,
+        server_tls_spki_sha256(),
+    )
+
+
+def root_ram_client_url(provider: HsmProvider) -> Optional[str]:
+    token = provider.get_config().get('root_connect_token')
+    if not token:
+        return None
+    origin = get_ram_public_origin()['origin'].rstrip('/')
+    return f'{origin}/hsm/ram/{token}'
+
+
+def _pka_detail(provider: HsmProvider, cfg: dict, status: dict, *, viewer_can_write_hsm: bool) -> dict:
+    live = status.get('pka') if status.get('ok') else None
+    manifest = cfg.get('ceremony_manifest')
+    device_chr = (live or {}).get('device_chr')
+    transcripts = cfg.get('transcripts') or []
+    detail = {
+        'pinned_device_chr': cfg.get('pinned_device_chr'),
+        'keyholders_locked': bool(cfg.get('keyholders_locked')),
+        'has_root_key': bool(cfg.get('public_key_pem')),
+        'root_connected': bool(status.get('root_connected')),
+        'manifest': manifest,
+        'manifest_sha256': (live or {}).get('manifest_sha256'),
+        'sas': _ceremony_sas(manifest, device_chr) if live else None,
+        'live': live,
+        'transcripts': [
+            {
+                'ceremony_id': t.get('ceremony_id'),
+                'final_hash': t.get('final_hash'),
+                'closed_at': t.get('closed_at'),
+                'entries': len(t.get('entries') or []),
+                'countersigned_by': sorted((t.get('countersignatures') or {}).keys()),
+            }
+            for t in reversed(transcripts[-5:])
+        ],
+    }
+    if viewer_can_write_hsm:
+        detail['root_ram_client_url'] = root_ram_client_url(provider)
+    return detail
+
+
+def begin_pka_ceremony(
+    provider: HsmProvider,
+    *,
+    operations: Optional[list],
+    max_signatures: Any,
+    ttl_hours: Any = None,
+    opened_by: Optional[str] = None,
+) -> dict:
+    from services.hsm import sc_hsm_pka as pka
+    cfg = provider.get_config()
+    threshold = int(cfg.get('threshold_n') or 0)
+    total = int(cfg.get('total_m') or 0)
+    if threshold < 1 or total < threshold:
+        raise ValueError('Set a threshold between 1 and the number of keyholders')
+    rows = provider.custodians.order_by(HsmCustodian.share_index).all()
+    if len(rows) != total:
+        raise ValueError(f'The roster has {len(rows)} keyholders; the provider expects {total}')
+    user_ids = [row.user_id for row in rows]
+    if None in user_ids or len(set(user_ids)) != len(user_ids):
+        raise ValueError('Each keyholder slot needs a different user')
+    keyholders = []
+    for row in rows:
+        if keyholder_key(row) is None:
+            raise ValueError(f'Keyholder in slot {row.share_index} has not enrolled a key')
+        keyholders.append({
+            'custodian_id': str(row.id),
+            'share_index': row.share_index,
+            'export_b64': row.auth_public_key,
+        })
+    try:
+        ops, budget = pka.validate_manifest_request(operations, max_signatures)
+    except pka.PkaError as exc:
+        raise ValueError(str(exc)) from exc
+    try:
+        hours = float(ttl_hours) if ttl_hours not in (None, '') else DEFAULT_WINDOW_HOURS
+    except (TypeError, ValueError) as exc:
+        raise ValueError('ttl_hours must be a number') from exc
+    if hours <= 0 or hours > MAX_WINDOW_HOURS:
+        raise ValueError(f'ttl_hours must be between 0 and {MAX_WINDOW_HOURS}')
+    if not cfg.get('root_connect_token'):
+        cfg['root_connect_token'] = secrets.token_urlsafe(32)
+        provider.set_config(cfg)
+        cfg = provider.get_config()
+    now = time.time()
+    expires_at = now + hours * 3600
+    manifest = {
+        'version': 1,
+        'ceremony_id': str(uuid.uuid4()),
+        'provider_id': provider.id,
+        'provider_name': provider.name,
+        'device_chr': cfg.get('pinned_device_chr'),
+        'threshold_n': threshold,
+        'total_m': total,
+        'opened_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now)),
+        'expires_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(expires_at)),
+        'opened_by': opened_by or '',
+        'operations': ops,
+        'max_signatures': budget,
+    }
+    if any(op['type'] == 'generate_root_key' for op in ops) and cfg.get('public_key_pem'):
+        raise ValueError('This provider already has a root key; a new root needs a new provider')
+    result = call_bridge('begin_ceremony', {
+        'device_scheme': 'pka',
+        'provider_id': provider.id,
+        'threshold_n': threshold,
+        'total_m': total,
+        'root_connect_token': cfg['root_connect_token'],
+        'keyholders': keyholders,
+        'pinned_device_chr': cfg.get('pinned_device_chr'),
+        'public_key_pem': cfg.get('public_key_pem'),
+        'manifest': manifest,
+        'expires_at': expires_at,
+    }, sock_path=_sock(provider))
+    if not result.get('ok'):
+        raise HsmOperationError(result.get('error') or 'begin_ceremony failed')
+    _set_ceremony_flags(
+        provider,
+        ceremony_active=True,
+        wipe_confirmed=False,
+        ocsp_acknowledged=False,
+        crl_stale=False,
+        assembly_slot=None,
+        ceremony_manifest=manifest,
+    )
+    provider.status = 'connected'
+    db.session.commit()
+    return {'ok': True, 'ceremony_id': manifest['ceremony_id'], 'manifest_sha256': pka.manifest_hash(manifest).hex()}
+
+
+def _bridge_pka(provider: HsmProvider, method: str, params: Optional[dict] = None) -> dict:
+    if not is_pka(provider):
+        raise ValueError('Not a public key authentication provider')
+    result = call_bridge(method, params or {}, sock_path=_sock(provider))
+    if not result.get('ok'):
+        raise HsmOperationError(result.get('error') or f'{method} failed')
+    return result
+
+
+def pin_root_device(provider: HsmProvider, device_chr: str) -> dict:
+    """Record the root HSM's device reference after it was read out on the call."""
+    device_chr = (device_chr or '').strip()
+    if not device_chr:
+        raise ValueError('device_chr is required')
+    cfg = provider.get_config()
+    if cfg.get('pinned_device_chr') and cfg['pinned_device_chr'] != device_chr:
+        raise ValueError('A different root HSM is already pinned for this provider')
+    _bridge_pka(provider, 'pka_pin_device', {'device_chr': device_chr})
+    cfg = provider.get_config()
+    cfg['pinned_device_chr'] = device_chr
+    # Pinning happens after the keyholder keys were registered at the site.
+    cfg['keyholders_locked'] = True
+    provider.set_config(cfg)
+    db.session.commit()
+    return {'ok': True, 'pinned_device_chr': device_chr}
+
+
+def keyholder_context(provider: HsmProvider, user_id: int) -> dict:
+    """Everything the keyholder agent shows before the keyholder approves."""
+    custodian = _custodian_for_user(provider, user_id)
+    key = keyholder_key(custodian)
+    cfg = provider.get_config()
+    status = bridge_status(provider)
+    live = status.get('pka') if status.get('ok') else None
+    manifest = cfg.get('ceremony_manifest')
+    cid = str(custodian.id)
+    return {
+        'provider_id': provider.id,
+        'provider_name': provider.name,
+        'custodian_id': custodian.id,
+        'share_index': custodian.share_index,
+        'enrolled': key.summary() if key else None,
+        'window_open': bool(live),
+        'manifest': manifest,
+        'manifest_sha256': (live or {}).get('manifest_sha256'),
+        'device_chr': (live or {}).get('device_chr'),
+        'pinned_device_chr': cfg.get('pinned_device_chr'),
+        'device_error': (live or {}).get('device_error'),
+        'config_error': (live or {}).get('config_error'),
+        'sas': _ceremony_sas(manifest, (live or {}).get('device_chr')) if live else None,
+        'tls_spki_sha256': server_tls_spki_sha256(),
+        'approved': cid in ((live or {}).get('approved') or []),
+        'authenticated': cid in ((live or {}).get('authenticated') or []),
+        'quorum': {
+            'authenticated': len((live or {}).get('authenticated') or []),
+            'required': int(cfg.get('threshold_n') or 0),
+            'unlocked': bool((live or {}).get('unlocked')),
+        },
+    }
+
+
+def keyholder_approve(provider: HsmProvider, user_id: int, signature_b64: str) -> dict:
+    custodian = _custodian_for_user(provider, user_id)
+    result = _bridge_pka(provider, 'pka_approve', {
+        'custodian_id': str(custodian.id), 'signature_b64': signature_b64 or '',
+    })
+    return {'ok': True, 'pka': result.get('pka')}
+
+
+def keyholder_challenge(provider: HsmProvider, user_id: int) -> dict:
+    custodian = _custodian_for_user(provider, user_id)
+    result = _bridge_pka(provider, 'pka_challenge', {'custodian_id': str(custodian.id)})
+    return result.get('result') or {}
+
+
+def keyholder_authenticate(provider: HsmProvider, user_id: int, signature_b64: str) -> dict:
+    custodian = _custodian_for_user(provider, user_id)
+    result = _bridge_pka(provider, 'pka_authenticate', {
+        'custodian_id': str(custodian.id), 'signature_b64': signature_b64 or '',
+    })
+    return result.get('result') or {}
+
+
+def generate_pka_root_key(provider: HsmProvider, confirm: str, bits: int = 2048) -> dict:
+    """Generate the root key inside the unlocked root HSM and record its public key."""
+    cfg = provider.get_config()
+    if cfg.get('public_key_pem'):
+        raise ValueError('This provider already has a root key; a new root needs a new provider')
+    if confirm != 'GENERATE':
+        raise ValueError('Type GENERATE to create the root key')
+    result = _bridge_pka(provider, 'pka_generate_root_key', {'confirm': confirm, 'bits': int(bits)})
+    public_pem = result.get('public_key_pem')
+    if not public_pem:
+        raise HsmOperationError('the root HSM did not return a public key')
+    cfg = provider.get_config()
+    cfg['public_key_pem'] = public_pem
+    provider.set_config(cfg)
+    db.session.add(HsmKey(
+        provider_id=provider.id,
+        key_identifier='1',
+        label=f'{provider.name} root',
+        algorithm=f'RSA-{int(bits)}',
+        key_type='asymmetric',
+        purpose='signing',
+        public_key_pem=public_pem,
+        is_extractable=False,
+    ))
+    _set_ceremony_flags(provider, crl_stale=True, wipe_confirmed=False)
+    db.session.commit()
+    digest = hashlib.sha256(public_pem.encode('ascii')).hexdigest()
+    return {'ok': True, 'public_key_pem': public_pem, 'public_key_sha256': digest}
+
+
+def _store_transcript(provider: HsmProvider, sealed: dict) -> None:
+    from services.hsm import sc_hsm_pka as pka
+    entries = sealed.get('entries') or []
+    final = pka.verify_transcript(entries)
+    if final != sealed.get('final_hash'):
+        raise HsmOperationError('the bridge returned a transcript whose hash chain does not match')
+    cfg = provider.get_config()
+    stored = list(cfg.get('transcripts') or [])
+    stored.append({
+        'ceremony_id': sealed.get('ceremony_id'),
+        'final_hash': final,
+        'closed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'entries': entries,
+        'countersignatures': {},
+    })
+    cfg['transcripts'] = stored[-MAX_STORED_TRANSCRIPTS:]
+    provider.set_config(cfg)
+    from services.audit_service import AuditService
+    AuditService.log_action(
+        action='hsm_ceremony_transcript',
+        resource_type='hsm_provider',
+        resource_id=provider.id,
+        resource_name=provider.name,
+        details=f'ceremony {sealed.get("ceremony_id")} transcript sealed; entries={len(entries)} final_sha256={final}',
+        success=True,
+    )
+
+
+def _rotate_connect_tokens(provider: HsmProvider) -> None:
+    """A connect URL is good for one window only."""
+    for row in provider.custodians.all():
+        row.set_connect_token(secrets.token_urlsafe(32))
+    cfg = provider.get_config()
+    if cfg.get('root_connect_token'):
+        cfg['root_connect_token'] = secrets.token_urlsafe(32)
+        provider.set_config(cfg)
+
+
+def get_transcript(provider: HsmProvider, ceremony_id: Optional[str] = None) -> dict:
+    """The live transcript of the open window, or a stored one."""
+    cfg = provider.get_config()
+    if not ceremony_id and cfg.get('ceremony_active') and is_pka(provider):
+        live = call_bridge('pka_transcript', sock_path=_sock(provider))
+        if live.get('ok'):
+            return {
+                'ceremony_id': (live.get('pka') or {}).get('ceremony_id'),
+                'sealed': False,
+                'entries': live.get('entries') or [],
+            }
+    stored = cfg.get('transcripts') or []
+    match = None
+    for item in reversed(stored):
+        if not ceremony_id or item.get('ceremony_id') == ceremony_id:
+            match = item
+            break
+    if match is None:
+        raise ValueError('No transcript found')
+    return {
+        'ceremony_id': match.get('ceremony_id'),
+        'sealed': True,
+        'final_hash': match.get('final_hash'),
+        'closed_at': match.get('closed_at'),
+        'entries': match.get('entries') or [],
+        'countersignatures': match.get('countersignatures') or {},
+    }
+
+
+def countersign_transcript(provider: HsmProvider, user_id: int, ceremony_id: str, signature_b64: str) -> dict:
+    """A keyholder confirms a sealed transcript with their enrolled key."""
+    from services.hsm import sc_hsm_pka as pka
+    custodian = _custodian_for_user(provider, user_id)
+    key = keyholder_key(custodian)
+    if key is None:
+        raise ValueError('You have not enrolled a key')
+    cfg = provider.get_config()
+    stored = list(cfg.get('transcripts') or [])
+    for item in stored:
+        if item.get('ceremony_id') == ceremony_id:
+            final = pka.verify_transcript(item.get('entries') or [])
+            try:
+                signature = base64.b64decode(signature_b64 or '', validate=True)
+            except (ValueError, TypeError) as exc:
+                raise ValueError('signature is not valid base64') from exc
+            pka.verify_keyholder_signature(key, pka.transcript_message(bytes.fromhex(final)), signature)
+            item.setdefault('countersignatures', {})[str(custodian.id)] = {
+                'signature_b64': base64.b64encode(signature).decode('ascii'),
+                'key_fingerprint': key.fingerprint,
+                'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            }
+            cfg['transcripts'] = stored
+            provider.set_config(cfg)
+            db.session.commit()
+            return {'ok': True, 'final_hash': final, 'countersigned_by': sorted(item['countersignatures'])}
+    raise ValueError('No sealed transcript with that ceremony id')

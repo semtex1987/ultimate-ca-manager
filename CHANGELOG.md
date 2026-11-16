@@ -10,7 +10,12 @@ Starting with v2.48, UCM uses Major.Build versioning (e.g., 2.48, 2.49). Earlier
 ## [Unreleased]
 
 ### Added
-- SmartCard-HSM remote ceremony: n-of-m DKEK shares stay on custodian tokens, an assembly card holds the root key only during a signing window, and custodians join with ram-client over a dedicated RAM origin.
+- SmartCard-HSM remote ceremony with n-of-m public key authentication: the root key is generated inside one SmartCard-HSM and never leaves it, and the HSM signs only after n keyholders, each anywhere, authenticate with a key on their own SmartCard-HSM. No key share, DKEK or PIN crosses the network. Keyholders approve a list of planned operations and a signature budget before the window opens, compare a short authentication string read aloud on a call, and countersign a hash-chained transcript of the ceremony. The keyholder agent is in `tools/keyholder/`; the design and its threat model are in `docs/design/sc-hsm-remote-ceremony-pka.md`.
+- Backups carry the keyholder roster of a SmartCard-HSM provider, with each keyholder's public key. The per-window connect token is not archived; a restore issues a new one.
+
+### Security
+- The RAM bridge requires TLS (1.2 or later) on its public listener, and its connect path `/hsm/ram/` has its own rate limit bucket instead of sharing the admin API's.
+- The DKEK share ceremony that preceded public key authentication passed shares through the UCM host in the clear. It never shipped in a release; on builds of the feature branch it is now refused unless `UCM_ALLOW_LEGACY_SHARE_CEREMONY=1` is set. A provider using it should move to public key authentication: keyholders enroll a key from their own card, and the root HSM is initialized and registered again at its site (`docs/HSM_DOCKER.md`).
 
 ## [2.235] - 2026-09-26
 

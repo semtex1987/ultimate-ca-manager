@@ -77,6 +77,8 @@ from services.hsm.sc_hsm_apdu import (
     sw_ok,
 )
 from utils.app_log import install_follower_handler
+from services.hsm import sc_hsm_pka as pka
+from services.hsm.pka_engine import ROOT_SLOT_ID, PkaCeremony, PkaRefused
 from services.hsm.vpcd_card import (
     DEFAULT_VPCD_HOST,
     DEFAULT_VPCD_PORT,
@@ -117,6 +119,27 @@ def _sock_path() -> str:
     return os.getenv('RAM_BRIDGE_SOCK', DEFAULT_SOCK_PATH)
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, '').strip().lower() in ('1', 'true', 'yes')
+
+
+def legacy_share_ceremony_allowed() -> bool:
+    """Remote DKEK-share assembly sends shares through this process in plaintext.
+
+    It stays off unless an operator opts in. See
+    docs/design/sc-hsm-remote-ceremony-pka.md, section 2.
+    """
+    return _env_flag('UCM_ALLOW_LEGACY_SHARE_CEREMONY')
+
+
+LEGACY_REFUSAL = (
+    'Remote DKEK-share ceremonies are disabled: they pass key shares through '
+    'the UCM host. Use a public key authentication (pka) provider, or set '
+    'UCM_ALLOW_LEGACY_SHARE_CEREMONY=1 on UCM and the RAM bridge to accept '
+    'that risk. See docs/design/sc-hsm-remote-ceremony-pka.md.'
+)
+
+
 # ---------------------------------------------------------------------------
 # Ceremony state
 # ---------------------------------------------------------------------------
@@ -131,6 +154,7 @@ class CeremonyState:
         self.provider_id: Optional[int] = None
         self.threshold_n = 0
         self.total_m = 0
+        self.device_scheme = 'shares'
         self.assembly_custodian_id: Optional[str] = None
         self.key_assembled = False
         self.root_key_id = ROOT_KEY_ID
@@ -143,7 +167,9 @@ class CeremonyState:
         self.public_key_pem: Optional[str] = None
         # Fake token used when PKCS#11/pcscd is unavailable (tests / dry-run).
         self.fake: Optional[FakeAssemblyToken] = None
-        self.use_fake = os.getenv('RAM_BRIDGE_FAKE', '').strip() in ('1', 'true', 'yes')
+        # Only the bridge's own environment turns fake mode on. A control
+        # request cannot, so a misconfigured UCM cannot swap in a software key.
+        self.use_fake = _env_flag('RAM_BRIDGE_FAKE')
         # Per-custodian share EF. Share bytes live here (the token), never in UCM.
         self.custodian_cards: Dict[str, FakeCustodianToken] = {}
         # User PIN of the token chosen as the assembly device for this window.
@@ -208,7 +234,16 @@ class RamBridge:
         vpcd_host: str = DEFAULT_VPCD_HOST,
         vpcd_port: int = DEFAULT_VPCD_PORT,
         bind_host: Optional[str] = None,
+        allow_plaintext: Optional[bool] = None,
     ):
+        self.allow_plaintext = (
+            allow_plaintext if allow_plaintext is not None
+            else _env_flag('RAM_BRIDGE_ALLOW_PLAINTEXT')
+        )
+        # Public key authentication ceremony (scheme 'pka'), or None.
+        self.pka: Optional[PkaCeremony] = None
+        self._pka_fake: Optional[pka.FakePkaRootHsm] = None
+        self._pka_fake_connected = False
         self.ram_port = ram_port if ram_port is not None else _env_int('RAM_PORT', DEFAULT_RAM_PORT)
         self.sock_path = sock_path or _sock_path()
         self.bind_host = bind_host if bind_host is not None else get_bind_host()
@@ -220,6 +255,7 @@ class RamBridge:
         self._http: Optional[ThreadingHTTPServer] = None
         self._control_sock: Optional[socket.socket] = None
         self._vpcd: Optional[VpcdClient] = None
+        self._vpcd_atr = b''
         self._stop = threading.Event()
         self._threads: List[threading.Thread] = []
         # token → custodian metadata for URL auth
@@ -267,31 +303,297 @@ class RamBridge:
             raise RuntimeError('assembly token not connected')
         return session.queue_transmit(apdu)
 
-    def _make_vpcd_card(self) -> VpcdVirtualCard:
+    def _pkcs11_session(self) -> Optional[RamSession]:
+        """Card PKCS#11 should be talking to.
+
+        The assembly card wins. Before one is chosen, a single connected
+        card is used so a random-DKEK ceremony can be seen by OpenSC.
+        Several connected cards and no assembly choice stay unanswered,
+        so the wrong token is not powered up.
+        """
+        if self.ceremony.use_fake:
+            return None
+        if self.pka is not None:
+            # The root HSM answers only the PKA engine. Presenting it to
+            # pcscd would let any local PC/SC client send it APDUs.
+            return None
         session = self._assembly_session()
+        if session is not None and session.connected:
+            return session
+        connected = list(self.sessions.connected_custodians())
+        if len(connected) == 1:
+            return self.sessions.get_by_custodian(connected[0])
+        return None
+
+    def _live_pkcs11_atr(self) -> bytes:
+        session = self._pkcs11_session()
+        if session is not None and session.atr:
+            return bytes(session.atr)
+        return b''
+
+    def _present_live_card(self) -> None:
+        """Make vpcd present the connected card's own ATR.
+
+        A stand-in ATR is rejected by OpenSC, and PKCS#11 then reports that
+        no token exists. Rebuilding the virtual card is what makes the real
+        ATR visible.
+        """
+        if self.ceremony.use_fake or self._vpcd is None:
+            return
+        atr = self._live_pkcs11_atr()
+        if not atr:
+            return
+        if self._vpcd.connected and self._vpcd_atr == atr:
+            return
+        logger.info('presenting card to vpcd atr_len=%s', len(atr))
+        self._vpcd.bounce()
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if self._vpcd.connected and self._vpcd_atr == atr:
+                return
+            time.sleep(0.2)
+        logger.warning('vpcd did not present the connected card')
+
+    def _make_vpcd_card(self) -> VpcdVirtualCard:
+        session = self._pkcs11_session()
         atr = b''
         if session and session.atr:
-            atr = session.atr
+            atr = bytes(session.atr)
         elif self.ceremony.fake is not None:
             atr = self.ceremony.fake.atr
         else:
+            atr = self._live_pkcs11_atr()
+        if not atr:
+            # Kept only so the reader can come up before a card connects.
+            # OpenSC does not treat this value as a SmartCard-HSM.
             atr = bytes.fromhex('3BFE1800008031FE4580318065B007405BFE70C3')
+        self._vpcd_atr = bytes(atr)
 
         def transmit(apdu: bytes) -> bytes:
             # Never log APDU bytes at info — contain key material.
             logger.debug('vpcd CAPDU len=%s', len(apdu))
-            return self.transmit_assembly(apdu)
+            with self.ceremony.lock:
+                fake = self.ceremony.fake
+                use_fake = self.ceremony.use_fake or fake is not None
+            if use_fake and fake is not None:
+                return fake.transmit(apdu)
+            live = self._pkcs11_session()
+            if live is None or not live.connected:
+                # Answer the reader. Raising here drops the virtual card and
+                # PKCS#11 goes back to seeing no token.
+                return b'\x69\x82'
+            try:
+                return live.queue_transmit(apdu)
+            except Exception:  # noqa: BLE001
+                logger.exception('vpcd transmit failed')
+                return b'\x6F\x00'
 
         def reset() -> bytes:
-            sess = self._assembly_session()
-            if sess and sess.connected:
-                return sess.queue_reset()
-            return atr
+            live = self._pkcs11_session()
+            if live is not None and live.connected:
+                try:
+                    got = live.queue_reset()
+                    if got:
+                        self._vpcd_atr = bytes(got)
+                        return got
+                except Exception:  # noqa: BLE001
+                    logger.exception('vpcd reset failed')
+            return self._vpcd_atr or atr
 
         return VpcdVirtualCard(atr=atr, transmit=transmit, reset=reset, powered=False)
 
+    # -- public key authentication: root HSM slot ------------------------------
+
+    def _root_session(self) -> Optional[RamSession]:
+        return self.sessions.get_by_custodian(ROOT_SLOT_ID)
+
+    def _root_connected(self) -> bool:
+        if self._pka_fake is not None:
+            return self._pka_fake_connected
+        session = self._root_session()
+        return bool(session is not None and session.connected)
+
+    def _root_transmit(self, apdu: bytes) -> bytes:
+        if self._pka_fake is not None:
+            if not self._pka_fake_connected:
+                raise RuntimeError('the root HSM is not connected')
+            return self._pka_fake.transmit(apdu)
+        session = self._root_session()
+        if session is None or not session.connected:
+            raise RuntimeError('the root HSM is not connected')
+        # Key generation on the card can take a minute.
+        return session.queue_transmit(apdu, timeout=120.0)
+
+    def _root_reset(self) -> bytes:
+        if self._pka_fake is not None:
+            return self._pka_fake.reset()
+        session = self._root_session()
+        if session is None or not session.connected:
+            raise RuntimeError('the root HSM is not connected')
+        return session.queue_reset(timeout=30.0)
+
+    def _sync_pka_flags(self) -> None:
+        engine = self.pka
+        if engine is None:
+            return
+        with self.ceremony.lock:
+            usable = engine.quorum() and bool(engine.public_key_pem)
+            self.ceremony.key_assembled = usable
+            self.ceremony.public_key_pem = engine.public_key_pem
+            self.ceremony.root_key_id = ROOT_KEY_ID
+            if usable:
+                self.ceremony.wipe_verified = False
+
+    def _pka_attach_async(self, session_id: str) -> None:
+        engine = self.pka
+
+        def run() -> None:
+            if engine is not None:
+                engine.attach(session_id)
+
+        threading.Thread(target=run, name='pka-attach', daemon=True).start()
+
+    def _pka(self, method, *args, **kwargs) -> dict:
+        """Run a PKA engine call; refusals are answers, not server errors."""
+        if self.pka is None:
+            return {'ok': False, 'error': 'no public key authentication ceremony is open'}
+        try:
+            result = method(*args, **kwargs)
+        except (PkaRefused, pka.PkaError) as exc:
+            logger.info('pka refused: %s', exc)
+            return {'ok': False, 'error': str(exc), 'pka': self.pka.snapshot() if self.pka else None}
+        finally:
+            self._sync_pka_flags()
+        return {'ok': True, 'result': result, 'pka': self.pka.snapshot() if self.pka else None}
+
+    @staticmethod
+    def _signature_param(params: dict) -> bytes:
+        raw = params.get('signature_b64') or ''
+        try:
+            signature = base64.b64decode(raw, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise pka.PkaError('signature is not valid base64') from exc
+        if not signature or len(signature) > 256:
+            raise pka.PkaError('signature has an invalid length')
+        return signature
+
+    def cmd_pka_pin_device(self, params: dict) -> dict:
+        return self._pka(lambda: self.pka.pin_device(str(params.get('device_chr') or '')))
+
+    def cmd_pka_approve(self, params: dict) -> dict:
+        def run():
+            self.pka.approve(str(params.get('custodian_id')), self._signature_param(params))
+        return self._pka(run)
+
+    def cmd_pka_challenge(self, params: dict) -> dict:
+        return self._pka(lambda: self.pka.challenge(str(params.get('custodian_id'))))
+
+    def cmd_pka_authenticate(self, params: dict) -> dict:
+        def run():
+            return self.pka.authenticate(str(params.get('custodian_id')), self._signature_param(params))
+        return self._pka(run)
+
+    def cmd_pka_generate_root_key(self, params: dict) -> dict:
+        if params.get('confirm') != 'GENERATE':
+            return {'ok': False, 'error': 'Type GENERATE to create the root key'}
+        bits = int(params.get('bits') or 2048)
+        result = self._pka(lambda: self.pka.generate_root_key(bits))
+        if result.get('ok'):
+            with self.ceremony.lock:
+                self.ceremony.mark_change()
+            result['public_key_pem'] = result.pop('result')
+        return result
+
+    def cmd_pka_transcript(self, _params: dict) -> dict:
+        if self.pka is None:
+            return {'ok': False, 'error': 'no public key authentication ceremony is open'}
+        return {'ok': True, 'entries': self.pka.transcript_entries(), 'pka': self.pka.snapshot()}
+
+    def _begin_pka(self, params: dict) -> dict:
+        n = int(params.get('threshold_n') or 0)
+        m = int(params.get('total_m') or 0)
+        root_token = params.get('root_connect_token')
+        if not root_token:
+            return {'ok': False, 'error': 'root_connect_token required'}
+        manifest = params.get('manifest')
+        if not isinstance(manifest, dict) or not manifest.get('ceremony_id'):
+            return {'ok': False, 'error': 'an approved-operations manifest is required'}
+        keyholders: Dict[str, pka.KeyholderKey] = {}
+        exports: List[bytes] = []
+        try:
+            for entry in params.get('keyholders') or []:
+                blob = base64.b64decode(entry.get('export_b64') or '', validate=True)
+                keyholders[str(entry['custodian_id'])] = pka.parse_pka_export(blob)
+                exports.append(blob)
+        except (KeyError, ValueError, TypeError, pka.PkaError) as exc:
+            return {'ok': False, 'error': f'keyholder enrollment is not valid: {exc}'}
+        with self.ceremony.lock:
+            if self.ceremony.active and (self.ceremony.key_assembled or (self.pka and self.pka.quorum())):
+                return {'ok': False, 'error': 'a window with an unlocked root HSM is already open'}
+            fake = None
+            if self.ceremony.use_fake:
+                fake = pka.FakePkaRootHsm(threshold_n=n, total_m=m)
+                for blob in exports:
+                    fake.register(blob)
+            self._pka_fake = fake
+            self._pka_fake_connected = False
+            try:
+                engine = PkaCeremony(
+                    provider_id=params.get('provider_id'),
+                    ceremony_id=str(manifest['ceremony_id']),
+                    threshold_n=n,
+                    total_m=m,
+                    keyholders=keyholders,
+                    pinned_device_chr=params.get('pinned_device_chr'),
+                    public_key_pem=params.get('public_key_pem'),
+                    manifest=manifest,
+                    max_signatures=int(manifest.get('max_signatures') or 0),
+                    expires_at=float(params.get('expires_at') or 0),
+                    transmit=self._root_transmit,
+                    reset=self._root_reset,
+                    connected=self._root_connected,
+                )
+            except (PkaRefused, ValueError) as exc:
+                self._pka_fake = None
+                return {'ok': False, 'error': str(exc)}
+            self.pka = engine
+            self.ceremony.active = True
+            self.ceremony.ca_id = params.get('ca_id')
+            self.ceremony.provider_id = params.get('provider_id')
+            self.ceremony.threshold_n = n
+            self.ceremony.total_m = m
+            self.ceremony.device_scheme = 'pka'
+            self.ceremony.assembly_custodian_id = None
+            self.ceremony.key_assembled = False
+            self.ceremony.wipe_verified = False
+            self.ceremony.error = None
+            self.ceremony.wrapped_root_b64 = None
+            self.ceremony.public_key_pem = params.get('public_key_pem')
+            self.ceremony.fake = None
+            self.ceremony.custodian_cards = {}
+            self.ceremony.clear_user_pin()
+            self.ceremony.last_change_seq = 0
+            self.ceremony.crl_seq_at_sign = -1
+        self._register_tokens([{
+            'connect_token': root_token,
+            'custodian_id': ROOT_SLOT_ID,
+            'share_index': 0,
+        }])
+        self.sessions.set_ceremony_active(True)
+        logger.info(
+            'pka ceremony begun provider=%s ceremony=%s n=%s m=%s',
+            params.get('provider_id'), manifest.get('ceremony_id'), n, m,
+        )
+        return {'ok': True, 'ceremony': self.ceremony.snapshot(), 'pka': engine.snapshot()}
+
     def _on_session_drop(self, session: RamSession) -> None:
         logger.warning('custodian %s dropped mid-ceremony', session.custodian_id)
+        if self.pka is not None and session.custodian_id == ROOT_SLOT_ID:
+            self.pka.detach()
+            self._sync_pka_flags()
+            with self.ceremony.lock:
+                self.ceremony.error = 'root HSM disconnected; keyholders must authenticate again'
+            return
         with self.ceremony.lock:
             if not self.ceremony.active:
                 return
@@ -326,10 +628,24 @@ class RamBridge:
             'create_root_key': self.cmd_create_root_key,
             'inspect_token': self.cmd_inspect_token,
             'prepare_token': self.cmd_prepare_token,
+            'pka_pin_device': self.cmd_pka_pin_device,
+            'pka_approve': self.cmd_pka_approve,
+            'pka_challenge': self.cmd_pka_challenge,
+            'pka_authenticate': self.cmd_pka_authenticate,
+            'pka_generate_root_key': self.cmd_pka_generate_root_key,
+            'pka_transcript': self.cmd_pka_transcript,
         }
         if method not in handlers:
             return {'ok': False, 'error': f'unknown method: {method}'}
-        if method in ('inspect_token', 'prepare_token', 'set_assembly', 'roll_root_key', 'create_root_key', 'begin_ceremony', 'wipe_assembly', 'end_ceremony'):
+        legacy_only = (
+            'set_assembly', 'import_share', 'unwrap_root', 'roll_root_key',
+            'create_root_key', 'inspect_token', 'prepare_token',
+        )
+        if self.pka is not None and method in legacy_only:
+            return {'ok': False, 'error': f'{method} does not apply to a public key authentication ceremony'}
+        if method in legacy_only and not legacy_share_ceremony_allowed():
+            return {'ok': False, 'error': LEGACY_REFUSAL}
+        if method in ('inspect_token', 'prepare_token', 'set_assembly', 'roll_root_key', 'create_root_key', 'begin_ceremony', 'wipe_assembly', 'end_ceremony') or method.startswith('pka_'):
             logger.info(
                 'control %s custodian=%s',
                 method,
@@ -428,10 +744,13 @@ class RamBridge:
                 has_share = len(share) > 0
             finally:
                 _zeroize(share)
-            card = classify_token_state(
-                0x6A, 0x88, b'',
-                0x90 if has_share else 0x6A, 0x00 if has_share else 0x82,
-            )
+            if self.ceremony.device_scheme == 'random' and not has_share:
+                card = classify_token_state(0x90, 0x00, bytes((0, 0)), 0x6A, 0x82)
+            else:
+                card = classify_token_state(
+                    0x6A, 0x88, b'',
+                    0x90 if has_share else 0x6A, 0x00 if has_share else 0x82,
+                )
             self._remember_card(custodian_id, card)
             return {'ok': True, 'card': card}
         try:
@@ -493,11 +812,22 @@ class RamBridge:
                 'error': 'Wipe the assembled root key before preparing tokens for a new scheme',
             }
         reinitialize = bool(params.get('reinitialize'))
-        scheme = (params.get('scheme') or 'shares').strip()
+        scheme = self._remember_scheme(params)
         inspected = self._inspect_custodian(cid)
         if not inspected.get('ok'):
             return inspected
         card = inspected['card']
+        if scheme == 'random' and not reinitialize:
+            if card.get('state') == 'has_dkek':
+                return {'ok': True, 'already_ready': True, 'card': card}
+            return {
+                'ok': False,
+                'error': (
+                    'This card is not holding a random DKEK. Reinitialize device '
+                    'to generate one. Prepare would replace it with a share domain.'
+                ),
+                'card': card,
+            }
         if card.get('ready') and not reinitialize:
             return {'ok': True, 'already_ready': True, 'card': card}
         if params.get('confirm') != 'DELETE':
@@ -508,6 +838,12 @@ class RamBridge:
             }
         share_count = int(params.get('dkek_shares') or self.ceremony.threshold_n or 1)
         key_domains = int(params.get('key_domains') or 1)
+        if scheme not in ('shares', 'random') and not reinitialize and card.get('state') != 'uninitialized':
+            return {
+                'ok': False,
+                'error': 'Reinitialize device to apply the card use saved on this provider.',
+                'card': card,
+            }
         so_pin = params.pop('so_pin', None) or ''
         user_pin = params.pop('user_pin', None) or ''
         try:
@@ -548,6 +884,10 @@ class RamBridge:
                 if not sw_ok(sw1, sw2):
                     raise RuntimeError(f'user PIN rejected SW={sw1:02X}{sw2:02X}')
                 logger.info('custodian %s reinitialized scheme=%s', cid, scheme)
+            elif scheme != 'shares':
+                raise RuntimeError(
+                    'Reinitialize device to apply the card use saved on this provider.'
+                )
             else:
                 session = self.sessions.get_by_custodian(cid)
                 self._ensure_hsm(session, 15.0)
@@ -577,24 +917,52 @@ class RamBridge:
         return self._inspect_custodian(cid)
 
     def cmd_status(self, _params: dict) -> dict:
-        self._probe_stale_custodians()
-        return {
+        engine = self.pka
+        if engine is None:
+            self._probe_stale_custodians()
+        else:
+            engine.refresh_status()
+            self._sync_pka_flags()
+        result = {
             'ok': True,
             'ceremony': self.ceremony.snapshot(),
             'custodians': self.sessions.status(),
             'vpcd_connected': bool(self._vpcd and self._vpcd.connected),
             'ram_port': self.ram_port,
         }
+        if engine is not None:
+            result['pka'] = engine.snapshot()
+            result['root_connected'] = self._root_connected()
+        return result
+
+    def _remember_scheme(self, params: dict) -> str:
+        scheme = (
+            params.get('device_scheme') or params.get('scheme')
+            or self.ceremony.device_scheme or 'shares'
+        ).strip()
+        if scheme not in ('none', 'random', 'shares', 'domains', 'pka'):
+            scheme = 'shares'
+        self.ceremony.device_scheme = scheme
+        return scheme
 
     def cmd_begin_ceremony(self, params: dict) -> dict:
+        if (params.get('device_scheme') or '').strip() == 'pka':
+            return self._begin_pka(params)
         custodians = params.get('custodians') or []
         if not custodians:
             return {'ok': False, 'error': 'custodians required'}
         n = int(params.get('threshold_n') or len(custodians))
         m = int(params.get('total_m') or len(custodians))
+        if params.get('use_fake') and not self.ceremony.use_fake:
+            logger.warning('begin_ceremony asked for fake mode; ignored (RAM_BRIDGE_FAKE is not set on the bridge)')
+        if not legacy_share_ceremony_allowed():
+            return {'ok': False, 'error': LEGACY_REFUSAL}
+        scheme = self._remember_scheme(params)
         with self.ceremony.lock:
             if self.ceremony.active and self.ceremony.key_assembled:
                 return {'ok': False, 'error': 'ceremony already has an assembled key'}
+            self.pka = None
+            self._pka_fake = None
             self.ceremony.active = True
             self.ceremony.ca_id = params.get('ca_id')
             self.ceremony.provider_id = params.get('provider_id')
@@ -614,18 +982,26 @@ class RamBridge:
             self.ceremony.clear_user_pin()
             self.ceremony.last_change_seq = 0
             self.ceremony.crl_seq_at_sign = -1
-            if self.ceremony.use_fake or params.get('use_fake'):
-                self.ceremony.use_fake = True
+            if self.ceremony.use_fake:
                 self.ceremony.fake = FakeAssemblyToken(threshold_n=n, total_m=m)
             else:
                 self.ceremony.fake = None
         self._register_tokens(custodians)
         self.sessions.set_ceremony_active(True)
         if self.ceremony.use_fake:
-            self.ceremony.custodian_cards = {
-                str(c['custodian_id']): FakeCustodianToken(os.urandom(32))
-                for c in custodians
-            }
+            if scheme == 'random':
+                self.ceremony.custodian_cards = {
+                    str(c['custodian_id']): FakeCustodianToken(b'')
+                    for c in custodians
+                }
+                if self.ceremony.fake is not None:
+                    self.ceremony.fake.outstanding = 0
+                    self.ceremony.fake._dkek_ready = True
+            else:
+                self.ceremony.custodian_cards = {
+                    str(c['custodian_id']): FakeCustodianToken(os.urandom(32))
+                    for c in custodians
+                }
         logger.info(
             'ceremony begun ca_id=%s n=%s m=%s custodians=%s',
             params.get('ca_id'), n, m, len(custodians),
@@ -643,6 +1019,12 @@ class RamBridge:
         cid = params.get('custodian_id')
         if cid is None:
             return {'ok': False, 'error': 'custodian_id required'}
+        if self.pka is not None:
+            if str(cid) != ROOT_SLOT_ID or self._pka_fake is None:
+                return {'ok': False, 'error': 'only the root HSM slot connects in a pka ceremony'}
+            self._pka_fake_connected = True
+            self.pka.attach('fake')
+            return {'ok': True, 'pka': self.pka.snapshot()}
         session = self.sessions.get_by_custodian(str(cid))
         if session is None:
             return {'ok': False, 'error': f'unknown custodian {cid}'}
@@ -764,7 +1146,8 @@ class RamBridge:
         """Drop a half-created key. Leave the default DKEK domain in place."""
         try:
             self._ignore_missing(self.transmit_assembly(apdu_delete_key_file(ROOT_KEY_ID)))
-            self._ignore_missing(self.transmit_assembly(apdu_clear_kek()))
+            if self.ceremony.device_scheme != 'random':
+                self._ignore_missing(self.transmit_assembly(apdu_clear_kek()))
         except Exception:  # noqa: BLE001 — best-effort cleanup
             logger.exception('failed to clear partial key')
         with self.ceremony.lock:
@@ -800,7 +1183,8 @@ class RamBridge:
                 'error': 'assembly token is not connected',
                 'ceremony': self.ceremony.snapshot(),
             }
-        if len(connected) < threshold:
+        scheme = self._remember_scheme(params)
+        if scheme != 'random' and len(connected) < threshold:
             return {
                 'ok': False,
                 'error': (
@@ -811,6 +1195,8 @@ class RamBridge:
         user_pin = params.pop('user_pin', None) or ''
         if user_pin:
             self.ceremony.remember_user_pin(user_pin)
+        if scheme == 'random':
+            return self._assemble_device_dkek(cid)
         ordered = [cid] + sorted(c for c in connected if c != cid)
         chosen = ordered[:threshold]
         with self.ceremony.lock:
@@ -912,34 +1298,52 @@ class RamBridge:
         Params: ``data_b64`` — raw bytes the PKCS#11 layer will hash+sign.
         Also marks the CRL as regenerated after the latest ceremony change.
         """
-        with self.ceremony.lock:
-            if not self.ceremony.key_assembled:
-                return {'ok': False, 'error': 'root key not assembled'}
-        data_b64 = params.get('data_b64')
-        if not data_b64:
-            return {'ok': False, 'error': 'data_b64 required'}
-        data = base64.b64decode(data_b64)
-        sig = self._sign_raw(data, params.get('hash_algorithm') or 'sha256')
+        signed = self._window_sign(params, default_label='CRL')
+        if not signed.get('ok'):
+            return signed
         # Signing the CRL is what regenerates it — mark seq.
         if params.get('is_crl', True):
             self.ceremony.mark_crl_signed()
-        return {
-            'ok': True,
-            'signature_b64': base64.b64encode(sig).decode('ascii'),
-            'ceremony': self.ceremony.snapshot(),
-        }
+        signed['ceremony'] = self.ceremony.snapshot()
+        return signed
 
     def cmd_sign(self, params: dict) -> dict:
         """Generic sign used by ScHsmCloudProvider.sign during the window."""
+        signed = self._window_sign(params)
+        if signed.get('ok'):
+            self.ceremony.mark_change()
+        return signed
+
+    def _window_sign(self, params: dict, *, default_label: str = '') -> dict:
+        """Sign with the root key of the open window, for that provider only."""
+        requested = params.get('provider_id')
         with self.ceremony.lock:
-            if not self.ceremony.key_assembled:
+            if not self.ceremony.active:
+                return {'ok': False, 'error': 'signing refused: no signing window is open'}
+            window_provider = self.ceremony.provider_id
+            if (
+                requested is not None and window_provider is not None
+                and str(requested) != str(window_provider)
+            ):
+                return {'ok': False, 'error': 'signing refused: the window is open for a different provider'}
+            if self.pka is None and not self.ceremony.key_assembled:
                 return {'ok': False, 'error': 'signing refused: ceremony key not assembled'}
         data_b64 = params.get('data_b64')
         if not data_b64:
             return {'ok': False, 'error': 'data_b64 required'}
         data = base64.b64decode(data_b64)
-        sig = self._sign_raw(data, params.get('hash_algorithm') or 'sha256')
-        self.ceremony.mark_change()
+        hash_name = params.get('hash_algorithm') or 'sha256'
+        if self.pka is not None:
+            result = self._pka(
+                self.pka.sign, data, hash_name,
+                label=str(params.get('label') or default_label),
+                provider_id=requested,
+            )
+            if not result.get('ok'):
+                return {'ok': False, 'error': result.get('error')}
+            sig = result['result']
+        else:
+            sig = self._sign_raw(data, hash_name)
         return {'ok': True, 'signature_b64': base64.b64encode(sig).decode('ascii')}
 
     def cmd_mark_change(self, _params: dict) -> dict:
@@ -966,6 +1370,37 @@ class RamBridge:
 
         return self._pkcs11_sign(data, hash_algorithm)
 
+    def _find_pkcs11_token(self, lib, token_label: str):
+        """Return the first PKCS#11 token, waiting briefly for the virtual reader.
+
+        An empty label matches whatever token the reader presents. pcscd takes
+        a moment after the card ATR is published.
+        """
+        deadline = time.monotonic() if self.ceremony.use_fake else time.monotonic() + 8
+        last_detail = 'no token matched'
+        while True:
+            slots = list(lib.get_slots())
+            if not slots:
+                last_detail = 'no PKCS#11 slots (pcscd is not serving a reader)'
+            else:
+                errors = []
+                for slot in slots:
+                    try:
+                        candidate = slot.get_token()
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(str(exc).strip() or type(exc).__name__)
+                        continue
+                    if not token_label:
+                        return candidate
+                    label = (getattr(candidate, 'label', '') or '').strip()
+                    if label == token_label:
+                        return candidate
+                last_detail = '; '.join(errors) if errors else 'no token matched'
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.3)
+        raise RuntimeError(f'token {token_label!r} not found ({last_detail})')
+
     def _pkcs11_sign(self, data: bytes, hash_algorithm: str) -> bytes:
         try:
             import pkcs11
@@ -980,32 +1415,27 @@ class RamBridge:
         lib = pkcs11.lib(module_path)
         token_label = os.getenv('SC_HSM_TOKEN_LABEL', '')
         pin = self._pkcs11_login_pin()
-        slots = list(lib.get_slots())
-        if not slots:
-            raise RuntimeError('no PKCS#11 slots (is vpcd/pcscd up?)')
-        token = None
-        for slot in slots:
-            try:
-                t = slot.get_token()
-            except Exception:  # noqa: BLE001
-                continue
-            if not token_label or t.label.strip() == token_label:
-                token = t
-                break
-        if token is None:
-            raise RuntimeError(f'token {token_label!r} not found')
+        if not self.ceremony.use_fake:
+            self._present_live_card()
+        token = self._find_pkcs11_token(lib, token_label)
         mech_map = {
             'sha256': Mechanism.SHA256_RSA_PKCS,
             'sha384': Mechanism.SHA384_RSA_PKCS,
             'sha512': Mechanism.SHA512_RSA_PKCS,
         }
         mechanism = mech_map.get(hash_algorithm, Mechanism.SHA256_RSA_PKCS)
+        key_ref = bytes(((self.ceremony.root_key_id or ROOT_KEY_ID) & 0xFF,))
         with token.open(user_pin=pin or None) as session:
+            # Select the root key by its id. Another private key on the
+            # card must never be used in its place.
             keys = list(session.get_objects({
                 pkcs11.Attribute.CLASS: pkcs11.ObjectClass.PRIVATE_KEY,
+                pkcs11.Attribute.ID: key_ref,
             }))
-            if not keys:
-                raise RuntimeError('no private key on assembly token')
+            if len(keys) != 1:
+                raise RuntimeError(
+                    f'expected one private key with id {key_ref.hex()} on the assembly token, found {len(keys)}'
+                )
             return keys[0].sign(data, mechanism=mechanism)
 
     def _pkcs11_roll_key(self) -> Tuple[str, bytes]:
@@ -1030,17 +1460,9 @@ class RamBridge:
         lib = pkcs11.lib(module_path)
         token_label = os.getenv('SC_HSM_TOKEN_LABEL', '')
         pin = self._pkcs11_login_pin()
-        token = None
-        for slot in lib.get_slots():
-            try:
-                candidate = slot.get_token()
-            except Exception:  # noqa: BLE001
-                continue
-            if not token_label or candidate.label.strip() == token_label:
-                token = candidate
-                break
-        if token is None:
-            raise RuntimeError(f'token {token_label!r} not found')
+        if not self.ceremony.use_fake:
+            self._present_live_card()
+        token = self._find_pkcs11_token(lib, token_label)
         key_id = self.ceremony.root_key_id or ROOT_KEY_ID
         key_ref = bytes((key_id,))
         self._assembly_busy = True
@@ -1122,6 +1544,16 @@ class RamBridge:
         if not sw_ok(sw1, sw2) and not (sw1 == 0x6A and sw2 == 0x82):
             self.ceremony.wipe_verified = False
             return False
+        if self.ceremony.device_scheme != 'random':
+            # The imported shares rebuilt the DKEK on this card. Left in
+            # place, this one card plus the stored wrapped blob would unwrap
+            # the root again without the other custodians.
+            cleared = self.transmit_assembly(apdu_clear_kek())
+            _, sw1, sw2 = parse_sw(cleared)
+            if not sw_ok(sw1, sw2) and (sw1, sw2) not in ((0x6A, 0x88), (0x6A, 0x82)):
+                logger.warning('clear DKEK after wipe failed SW=%02X%02X', sw1, sw2)
+                self.ceremony.wipe_verified = False
+                return False
         # Verified wipe: list via PKCS#11 when available; else trust delete SW.
         verified = True
         try:
@@ -1166,6 +1598,8 @@ class RamBridge:
                         'error': 'CRL must be regenerated after the latest change before wipe',
                         'ceremony': self.ceremony.snapshot(),
                     }
+            if self.pka is not None:
+                return self._pka_lock()
             # If nothing was ever assembled, treat wipe as success (nothing to delete).
             if not self.ceremony.key_assembled:
                 self.ceremony.wipe_verified = True
@@ -1183,6 +1617,31 @@ class RamBridge:
                     'ceremony': self.ceremony.snapshot(),
                 }
             return {'ok': True, 'wipe_verified': True, 'ceremony': self.ceremony.snapshot()}
+
+    def _pka_lock(self) -> dict:
+        """End root key use: reset the root HSM and read back zero authentications."""
+        engine = self.pka
+        try:
+            verified = engine.lock_device()
+        except (PkaRefused, pka.PkaError, RuntimeError, TimeoutError) as exc:
+            verified = False
+            self.ceremony.error = f'lock failed: {exc}'
+        self._sync_pka_flags()
+        with self.ceremony.lock:
+            self.ceremony.wipe_verified = verified
+            if verified:
+                self.ceremony.key_assembled = False
+        if not verified:
+            return {
+                'ok': False,
+                'error': (
+                    'the root HSM could not be confirmed locked; keep the window open, '
+                    'reconnect the root HSM and lock again, or power it off at the site'
+                ),
+                'ceremony': self.ceremony.snapshot(),
+                'pka': engine.snapshot(),
+            }
+        return {'ok': True, 'wipe_verified': True, 'ceremony': self.ceremony.snapshot(), 'pka': engine.snapshot()}
 
     def _roster_custodian_ids(self) -> List[str]:
         with self._token_lock:
@@ -1239,6 +1698,90 @@ class RamBridge:
             'a new share (SW=6985). Reinitialize that token in this window, '
             'then create the root key again.'
         )
+
+    def _mark_device_dkek_ready(self) -> None:
+        fake = self.ceremony.fake
+        if fake is None:
+            return
+        fake.outstanding = 0
+        fake._dkek_ready = True
+
+    def _store_installed_root(self, public_pem: str, wrapped: bytes, shares_written: int) -> dict:
+        with self.ceremony.lock:
+            self.ceremony.wrapped_root_b64 = base64.b64encode(wrapped).decode('ascii')
+            self.ceremony.public_key_pem = public_pem
+            self.ceremony.key_assembled = True
+            if self.ceremony.fake is not None and self.ceremony.fake.root_key_id is not None:
+                self.ceremony.root_key_id = self.ceremony.fake.root_key_id
+            self.ceremony.wipe_verified = False
+            self.ceremony.mark_change()
+        return {
+            'ok': True,
+            'public_key_pem': public_pem,
+            'wrapped_root_b64': self.ceremony.wrapped_root_b64,
+            'shares_written': shares_written,
+            'ceremony': self.ceremony.snapshot(),
+        }
+
+    def _generate_on_device_dkek(self) -> Tuple[str, bytes]:
+        """Generate and wrap a key under the DKEK already on the card.
+
+        A random DKEK never leaves the token. Clearing it or importing shares
+        would replace that device key.
+        """
+        with self.ceremony.lock:
+            use_fake = self.ceremony.use_fake and self.ceremony.fake is not None
+        if use_fake:
+            self._mark_device_dkek_ready()
+            return self.ceremony.fake.rotate_signing_key()
+        self._ignore_missing(self.transmit_assembly(apdu_delete_key_file(ROOT_KEY_ID)))
+        return self._pkcs11_roll_key()
+
+    def _install_device_dkek_root(self, assembly_custodian_id: str) -> dict:
+        connected = self.sessions.connected_custodians()
+        if assembly_custodian_id not in connected:
+            return {'ok': False, 'error': 'assembly token is not connected'}
+        with self.ceremony.lock:
+            self.ceremony.assembly_custodian_id = assembly_custodian_id
+            self.ceremony.error = None
+        try:
+            public_pem, wrapped = self._generate_on_device_dkek()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception('create root key failed')
+            self._abort_partial_assembly()
+            message = str(exc).strip() or type(exc).__name__
+            return {'ok': False, 'error': message, 'ceremony': self.ceremony.snapshot()}
+        logger.info('root key created on custodian %s under device DKEK', assembly_custodian_id)
+        return self._store_installed_root(public_pem, wrapped, 0)
+
+    def _assemble_device_dkek(self, assembly_custodian_id: str) -> dict:
+        with self.ceremony.lock:
+            self.ceremony.assembly_custodian_id = assembly_custodian_id
+            self.ceremony.error = None
+            use_fake = self.ceremony.use_fake and self.ceremony.fake is not None
+        try:
+            if use_fake:
+                self._mark_device_dkek_ready()
+            unwrapped = self.cmd_unwrap_root({})
+            if not unwrapped.get('ok'):
+                raise RuntimeError(unwrapped.get('error') or 'unwrap failed')
+            self._remember_public_key()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception('assembly failed')
+            self._abort_partial_assembly()
+            return {'ok': False, 'error': str(exc), 'ceremony': self.ceremony.snapshot()}
+        return {'ok': True, 'ceremony': self.ceremony.snapshot()}
+
+    def _roll_device_dkek(self) -> dict:
+        cid = self.ceremony.assembly_custodian_id
+        if not cid or cid not in self.sessions.connected_custodians():
+            return {'ok': False, 'error': 'assembly token is not connected'}
+        try:
+            public_pem, wrapped = self._generate_on_device_dkek()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception('key roll failed')
+            return {'ok': False, 'error': str(exc), 'ceremony': self.ceremony.snapshot()}
+        return self._store_installed_root(public_pem, wrapped, 0)
 
     def _install_new_root(self, assembly_custodian_id: str) -> dict:
         """Write one share per custodian, import the threshold, and generate the key.
@@ -1328,6 +1871,13 @@ class RamBridge:
         user_pin = params.pop('user_pin', None) or ''
         if user_pin:
             self.ceremony.remember_user_pin(user_pin)
+        if self._remember_scheme(params) == 'random':
+            return self._install_device_dkek_root(cid)
+        if self.ceremony.device_scheme not in ('shares', 'random'):
+            return {
+                'ok': False,
+                'error': 'Create root key applies to an n-of-m share provider or a random DKEK',
+            }
         return self._install_new_root(cid)
 
     def cmd_roll_root_key(self, params: dict) -> dict:
@@ -1344,7 +1894,8 @@ class RamBridge:
             total = self.ceremony.total_m
             use_fake = self.ceremony.use_fake and self.ceremony.fake is not None
         connected = self.sessions.connected_custodians()
-        if len(connected) < total:
+        scheme = self._remember_scheme(params or {})
+        if scheme != 'random' and len(connected) < total:
             return {
                 'ok': False,
                 'error': (
@@ -1355,6 +1906,8 @@ class RamBridge:
         user_pin = (params or {}).pop('user_pin', None) or ''
         if user_pin:
             self.ceremony.remember_user_pin(user_pin)
+        if scheme == 'random':
+            return self._roll_device_dkek()
         try:
             shares = generate_dkek_shares(threshold, total)
             # Same share_index order as create. _token_map is keyed by connect
@@ -1405,6 +1958,24 @@ class RamBridge:
             return {'ok': False, 'error': str(exc), 'ceremony': self.ceremony.snapshot()}
 
     def cmd_end_ceremony(self, params: dict) -> dict:
+        engine = self.pka
+        sealed = None
+        if engine is not None:
+            ever_authenticated = engine.unlocked_logged or bool(engine.authenticated)
+            if ever_authenticated and not engine.locked_verified and not params.get('force'):
+                return {
+                    'ok': False,
+                    'error': 'lock the root HSM before closing the window',
+                    'ceremony': self.ceremony.snapshot(),
+                    'pka': engine.snapshot(),
+                }
+            sealed = engine.seal()
+            with self.ceremony.lock:
+                self.pka = None
+                self._pka_fake = None
+                self._pka_fake_connected = False
+                self.ceremony.key_assembled = False
+                self.ceremony.wipe_verified = True
         with self.ceremony.lock:
             if self.ceremony.key_assembled and not self.ceremony.wipe_verified:
                 if not params.get('force'):
@@ -1427,7 +1998,10 @@ class RamBridge:
         self.sessions.drop_all('end_ceremony')
         with self._token_lock:
             self._token_map.clear()
-        return {'ok': True, 'ceremony': self.ceremony.snapshot()}
+        result = {'ok': True, 'ceremony': self.ceremony.snapshot()}
+        if sealed is not None:
+            result['transcript'] = sealed
+        return result
 
     # -- servers --------------------------------------------------------------
 
@@ -1478,7 +2052,13 @@ class RamBridge:
         if os.path.exists(path):
             os.unlink(path)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(path)
+        # Create the socket file 0600 from the start. A chmod after bind
+        # leaves a moment where another local user could connect.
+        previous_umask = os.umask(0o177)
+        try:
+            sock.bind(path)
+        finally:
+            os.umask(previous_umask)
         try:
             os.chmod(path, 0o600)
         except OSError:
@@ -1554,7 +2134,11 @@ class RamBridge:
                 if not token or '/' in token:
                     self.send_error(404)
                     return
-                length = int(self.headers.get('Content-Length') or 0)
+                raw_length = (self.headers.get('Content-Length') or '0').strip()
+                if not raw_length.isdigit():
+                    self.send_error(400)
+                    return
+                length = int(raw_length)
                 if length > MAX_BODY_BYTES:
                     self.send_error(413)
                     return
@@ -1589,18 +2173,25 @@ class RamBridge:
                     self.end_headers()
                     self.wfile.write(out or b'')
 
-        httpd = ThreadingHTTPServer((self.bind_host, self.ram_port), Handler)
         cert, key = _cert_paths()
-        if os.path.isfile(cert) and os.path.isfile(key):
+        have_tls = os.path.isfile(cert) and os.path.isfile(key)
+        if not have_tls and not self.allow_plaintext:
+            # Fail closed: the RAM channel carries card traffic.
+            raise RuntimeError(
+                f'RAM listener needs a TLS certificate ({cert}, {key}). '
+                'Set HTTPS_CERT_PATH/HTTPS_KEY_PATH, or RAM_BRIDGE_ALLOW_PLAINTEXT=1 '
+                'for local development only.'
+            )
+        httpd = ThreadingHTTPServer((self.bind_host, self.ram_port), Handler)
+        if have_tls:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ctx.load_cert_chain(certfile=cert, keyfile=key)
             httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
             logger.info('TLS enabled with %s', cert)
         else:
             logger.warning(
-                'HTTPS_CERT_PATH/HTTPS_KEY_PATH missing (%s, %s); '
-                'listening without TLS (dev only)',
-                cert, key,
+                'RAM_BRIDGE_ALLOW_PLAINTEXT is set; listening without TLS (development only)',
             )
         self._http = httpd
         t = threading.Thread(target=httpd.serve_forever, name='ram-http', daemon=True)
@@ -1622,6 +2213,12 @@ class RamBridge:
                 session.custodian_id,
                 len(session.atr or b''),
             )
+            if self.pka is not None and session.custodian_id == ROOT_SLOT_ID:
+                # Identify the device on a worker thread: its APDUs travel
+                # through this client's next long-poll requests.
+                self._pka_attach_async(session.session_id)
+            else:
+                self._present_live_card()
             # First reply: keepalive or pending work
             tmpl = session.build_request(keepalive_if_idle=True)
             return 200, tmpl.encode()

@@ -55,9 +55,43 @@ export const hsmService = {
     return apiClient.post('/hsm/dependencies/install')
   },
 
-  /** Open an offline-root signing window for SmartCard-HSM (sc-hsm-cloud). */
-  async beginCeremony(providerId) {
-    return apiClient.post(`/hsm/providers/${providerId}/ceremony/begin`)
+  /**
+   * Open an offline-root signing window for SmartCard-HSM (sc-hsm-cloud).
+   * A public key authentication provider needs the planned operations:
+   * { operations: [{ type, label, ca_id? }], max_signatures, ttl_hours }.
+   */
+  async beginCeremony(providerId, manifest = undefined) {
+    return apiClient.post(`/hsm/providers/${providerId}/ceremony/begin`, manifest)
+  },
+
+  /** Upload the caller's own sc-hsm-tool --export-for-pub-key-auth file (base64). */
+  async enrollKeyholder(providerId, exportB64) {
+    return apiClient.post(`/hsm/providers/${providerId}/ceremony/keyholder/enroll`, {
+      export_b64: exportB64,
+    })
+  },
+
+  /** Zip of every keyholder export, for sc-hsm-tool at the root HSM site. */
+  async downloadRegistrationBundle(providerId) {
+    return apiClient.download(`/hsm/providers/${providerId}/ceremony/registration-bundle`)
+  },
+
+  /** Pin the connected root HSM after its device reference was read out on the call. */
+  async pinRootDevice(providerId, deviceChr) {
+    return apiClient.post(`/hsm/providers/${providerId}/ceremony/pin-device`, {
+      device_chr: deviceChr,
+    })
+  },
+
+  /** Generate the root key inside the unlocked root HSM. `confirm` must be GENERATE. */
+  async generatePkaRootKey(providerId, confirm, bits = 2048) {
+    return apiClient.post(`/hsm/providers/${providerId}/ceremony/generate-root-key`, { confirm, bits })
+  },
+
+  /** Live transcript of the open window, or a stored one. */
+  async getCeremonyTranscript(providerId, ceremonyId = '') {
+    const query = ceremonyId ? `?ceremony_id=${encodeURIComponent(ceremonyId)}` : ''
+    return apiClient.get(`/hsm/providers/${providerId}/ceremony/transcript${query}`)
   },
 
   /** Read key-domain and share-file status for one connected token. */

@@ -71,6 +71,9 @@ class HsmService:
         
         provider_class = cls._provider_registry[provider.type]
         config = provider.get_config()
+        if provider.type == 'sc-hsm-cloud':
+            # Lets the provider check that an open window belongs to it.
+            config['_provider_id'] = provider.id
         return provider_class(config)
     
     # =========================================================================
@@ -125,7 +128,10 @@ class HsmService:
 
         config = dict(config or {})
         custodians = config.pop('custodians', None) if provider_type == 'sc-hsm-cloud' else None
-        
+        if provider_type == 'sc-hsm-cloud':
+            from services.hsm.ceremony_service import protect_ceremony_config
+            config = protect_ceremony_config(config, {})
+
         # Create provider
         provider = HsmProvider(
             name=name,
@@ -195,6 +201,14 @@ class HsmService:
             custodians = None
             if provider.type == 'sc-hsm-cloud' and 'custodians' in config:
                 custodians = config.pop('custodians')
+            if provider.type == 'sc-hsm-cloud':
+                from services.hsm.ceremony_service import (
+                    check_bound_provider_change,
+                    protect_ceremony_config,
+                )
+                existing_cfg = provider.get_config()
+                check_bound_provider_change(provider, existing_cfg, config, custodians)
+                config = protect_ceremony_config(config, existing_cfg)
             # set_config encrypts sensitive fields and drops mask sentinels
             # ('***'/'********') so an operator updating non-secret fields
             # via the UI doesn't wipe stored credentials.

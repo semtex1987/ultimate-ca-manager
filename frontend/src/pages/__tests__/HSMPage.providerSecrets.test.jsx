@@ -9,7 +9,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import './pageRenderingSetup.jsx'
 
-import { ProviderModal, accessStepReached } from '../HSMPage'
+import { ProviderModal, accessStepReached, ceremonyGuideKeys } from '../HSMPage'
 
 const CASES = [
   ['pkcs11', { pkcs11_library_path: '/usr/lib/softhsm/libsofthsm2.so', pkcs11_token_label: 'UCM-Default', pkcs11_pin: '***' }, 'user_pin'],
@@ -89,6 +89,31 @@ describe('HSM provider form, stored secrets', () => {
       expect(config).not.toHaveProperty(key)
     }
     expect(JSON.stringify(config)).not.toMatch(/SHOULD-NOT-APPEAR|dkek_share|share_bytes|share_value/i)
+  })
+})
+
+describe('ceremony guide order', () => {
+  it('tells a first-time random DKEK user to connect, initialize, then create', () => {
+    expect(ceremonyGuideKeys({ device_scheme: 'random' }, true)).toEqual([
+      'hsm.ceremony.guide.randomFirst1',
+      'hsm.ceremony.guide.randomFirst2',
+      'hsm.ceremony.guide.randomFirst3',
+      'hsm.ceremony.guide.wipeThenClose',
+    ])
+  })
+
+  it('tells a later random window to restore on the same card', () => {
+    expect(ceremonyGuideKeys({ device_scheme: 'random', has_wrapped_root: true }, true)).toEqual([
+      'hsm.ceremony.guide.randomRestore1',
+      'hsm.ceremony.guide.randomRestore2',
+      'hsm.ceremony.guide.wipeThenClose',
+    ])
+  })
+
+  it('does not offer a setup sequence for No DKEK', () => {
+    expect(ceremonyGuideKeys({ device_scheme: 'none' }, true)).toEqual([
+      'hsm.ceremony.guide.none',
+    ])
   })
 })
 

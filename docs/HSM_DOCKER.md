@@ -52,6 +52,11 @@ Before 2.233, a container started without that volume kept its tokens inside the
 | `HSM_PIN` | *(random)* | PIN for the auto-initialized token |
 | `HSM_SO_PIN` | *(random)* | SO PIN for the auto-initialized token |
 | `RAM_PORT` | `8444` | SmartCard-HSM RAM bridge listen port for `ram-client` (not AWS CloudHSM) |
+| `RAM_BRIDGE_ALLOW_PLAINTEXT` | *(unset)* | The RAM bridge refuses to start without `HTTPS_CERT_PATH`/`HTTPS_KEY_PATH`. Set to `1` only for local development. |
+| `UCM_ALLOW_LEGACY_SHARE_CEREMONY` | *(unset)* | Re-enables remote DKEK-share, random-DKEK and key-domain ceremonies, which pass key material through the UCM host. Set on UCM **and** the bridge. Not recommended; use public key authentication. |
+| `UCM_PUBLIC_TLS_SPKI_SHA256` | *(UCM certificate)* | SHA-256 of the public key keyholders see on the UCM HTTPS endpoint, used in the ceremony SAS. Set it to the proxy certificate's value behind a TLS-terminating proxy. |
+| `UCM_PKA_SIGNATURE_FORMAT` | `plain` | Signature encoding sent to `EXTERNAL AUTHENTICATE` (`plain` r‖s or `der`). Change only if the hardware checklist says so. |
+| `UCM_PKA_DEVICE_ID_FORMAT` | `chr` | Device id keyholders sign before the challenge (`chr` or `chr_tlv`). Change only if the hardware checklist says so. |
 | `UCM_ALLOW_RUNTIME_PIP` | *(unset)* | Set to `1` to enable the in-app "Install dependencies" button (HSM page). Disabled by default since v2.142, see below. |
 
 ## Runtime PKCS#11 dependency installer
@@ -141,7 +146,32 @@ Configure cloud HSM providers via the UCM web UI (Settings → HSM):
 
 ## SmartCard-HSM (remote) — not AWS CloudHSM
 
-Provider type `sc-hsm-cloud` is a USB SmartCard-HSM signing window for an **offline root**. It is unrelated to AWS CloudHSM. Custodian tokens assemble the root key inside one chip for a ceremony, then the key is wiped. Between ceremonies the CA stays offline.
+Provider type `sc-hsm-cloud` is a USB SmartCard-HSM signing window for an **offline root**. It is unrelated to AWS CloudHSM. Between ceremonies the CA stays offline.
+
+There are two ways to run it. **Public key authentication** (card use *n-of-m public key authentication*, `device_scheme: pka`) is the default and the only one enabled out of the box. The older share-based card uses are described further down and stay disabled unless `UCM_ALLOW_LEGACY_SHARE_CEREMONY=1` is set.
+
+### Public key authentication (remote keyholders)
+
+The root key is generated in one SmartCard-HSM, the **root HSM**, and never leaves it. That HSM is initialized so that `n` of `m` registered keyholder keys must authenticate before any key on it can be used. Each keyholder has their own SmartCard-HSM and proves possession of their key from wherever they are, by signing a challenge from the root HSM. No key share, DKEK or PIN crosses the network, and UCM cannot use the root key without the keyholders. The design, threat model and hardware checklist are in [`docs/design/sc-hsm-remote-ceremony-pka.md`](design/sc-hsm-remote-ceremony-pka.md).
+
+**Once, per keyholder.** Create an EC key on your card and upload its export with the [keyholder agent](../tools/keyholder/README.md) (`ucm_keyholder.py enroll`) or with **Upload key export** on the HSM page. Read your fingerprint aloud on a witnessed call.
+
+**Once, at the HSM site.** Download the **registration bundle** from the HSM page (`write:hsm`). With keyholders and a witness on the call, run the commands in its `README.txt`: `sc-hsm-tool --initialize … --public-key-auth <m> --required-pub-keys <n>`, one `--register-public-key` per file, then `--public-key-auth-status`. The SO-PIN and user PIN are typed into that local tool only.
+
+**Each ceremony.**
+
+1. An operator lists the planned operations and a signature budget, then opens the window. The plan (manifest) is what keyholders approve.
+2. At the HSM site, the root HSM is attached and `ram-client` runs with the root slot command the page shows (`write:hsm` only). UCM reads the device reference. The first time, the operator types the reference read aloud at the site to **pin** it. A different device is refused from then on.
+3. On the call, each keyholder runs `ucm_keyholder.py approve`. The agent shows the plan, the device and the **SAS**. The keyholder reads the SAS aloud, the page shows the same code, and the keyholder approves with their own card and PIN.
+4. When `n` keyholders have authenticated, the root HSM is unlocked. The first window generates the root key (**Generate root key**). Later windows carry out the planned operations. Each signature uses one unit of the budget.
+5. **Lock root HSM** publishes the CRLs of bound CAs, resets the card and reads back zero authenticated keyholders. Then **Close window**. Connect URLs are replaced for the next window.
+6. Each keyholder verifies the transcript and countersigns it: `ucm_keyholder.py transcript --countersign`.
+
+A pka root is never re-keyed in place. A new root key needs a new provider, cross-certified if relying parties need continuity. Threshold, total and roster are fixed once keys are registered on the root HSM.
+
+### Share-based card uses (legacy, disabled by default)
+
+These card uses rebuild the root key from DKEK shares read off custodian tokens in each window. Those shares pass through the UCM host in plaintext, so these ceremonies are refused unless `UCM_ALLOW_LEGACY_SHARE_CEREMONY=1` is set on UCM and on the bridge. The rest of this section describes them.
 
 ### Where `ram-client` connects
 
@@ -217,7 +247,8 @@ When you create the provider, **Card use** is the only place the device-key sche
 | Card use | What the ceremony asks later |
 | --- | --- |
 | n-of-m ceremony | Threshold (how many shares must be present) and total (how many tokens receive a share). Reinitialize uses the threshold. It does not ask for a share count. |
-| No DKEK, randomly generated DKEK, or key domains | That scheme, and a domain count when the choice is key domains. The ceremony initializes the card with the saved scheme. Create root key and assembly stay on the n-of-m path. |
+| Randomly generated DKEK | Reinitialize generates the DKEK on that one card. Create root key wraps a new signing key under it. No share file is written. A later window uses that same card as the assembly device. Prepare token does not apply: it would replace the random DKEK with a share domain. |
+| Key domains | Reinitialize applies that scheme. This signing window cannot create or restore a wrapped root for it. |
 
 #### Reinitialize device
 
@@ -254,6 +285,16 @@ Opening the next window clears the saved assembly slot. Any connected token that
 
 Assembly reads the threshold of share files from the tokens that are connected now, then unwraps the stored root. With n-of-m, any `n` of the share holders are enough. With n-of-n, a missing token blocks assembly. **Roll root key** still needs the assembled key and every custodian connected, because it writes a new share onto the full roster.
 
+#### Single card (random DKEK)
+
+1. Open the signing window.
+2. Run `ram-client` from the command on the row. Wait until the row says Connected.
+3. **Check token**. If the card does not already hold a random DKEK, **Reinitialize device**. That erases the card. Type `DELETE`.
+4. Type that user PIN again, then **Create root key on this token**. Type `DELETE`. No share file is written. Only this card can unwrap the key later.
+5. When you are finished, **Wipe assembly key**, then **Close window**.
+
+A later window uses the same card: connect it, type the user PIN, **Use as assembly device**, then wipe and close. **Prepare token** is not used on this card. It would replace the random DKEK.
+
 #### Status words
 
 | SW | Where it shows up | Meaning |
@@ -286,7 +327,7 @@ ACME, SCEP, EST, WSTEP, TSA responses, and unattended OCSP that would need the r
 
 ### Image / package notes
 
-The Docker image includes `pcscd`, OpenSC (`sc-hsm-tool`), `opensc-pkcs11`, and `vsmartcard-vpcd` (bookworm IFD for `libifdvpcd.so`, registered in `/etc/reader.conf.d/vpcd` on the default vpcd port **35963**). SoftHSM is unchanged. The entrypoint starts `pcscd`, then the RAM bridge (when `backend/services/hsm/ram_bridge.py` is present), then Gunicorn. DEB/RPM ship `ucm-ram-bridge.service`, ordered before `ucm.service`.
+The Docker image includes `pcscd`, OpenSC (`sc-hsm-tool`), `opensc-pkcs11`, and `vsmartcard-vpcd` (bookworm IFD for `libifdvpcd.so`, registered in `/etc/reader.conf.d/vpcd` on the default vpcd port **35963**). SoftHSM is unchanged. The entrypoint starts `pcscd`, then the RAM bridge (when `backend/services/hsm/ram_bridge.py` is present), then Gunicorn. A socket left behind by a dead `pcscd` is removed before start. A live process is what counts: the socket file alone is not enough, and PKCS#11 then reports that no token was found. DEB/RPM ship `ucm-ram-bridge.service`, ordered before `ucm.service`.
 
 ## Backup & Restore
 

@@ -30,6 +30,13 @@ from services.hsm.sc_hsm_apdu import generate_dkek_shares
 from services.hsm.sc_hsm_cloud_provider import ScHsmCloudProvider, call_bridge
 
 
+@pytest.fixture(autouse=True)
+def _legacy_share_mode(monkeypatch):
+    """These tests cover the legacy share scheme, which is opt-in, over plain HTTP."""
+    monkeypatch.setenv('UCM_ALLOW_LEGACY_SHARE_CEREMONY', '1')
+    monkeypatch.setenv('RAM_BRIDGE_ALLOW_PLAINTEXT', '1')
+
+
 @pytest.fixture
 def bridge_sock():
     sock = f'/tmp/ucm-ram-e2e-{os.getpid()}.sock'

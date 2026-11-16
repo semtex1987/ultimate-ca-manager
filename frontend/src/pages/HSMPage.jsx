@@ -19,6 +19,7 @@ import { useNotification, useMobile, useAuth } from '../contexts'
 import { usePermission, useClipboard, usePersistedState } from '../hooks'
 import { hsmService, usersService } from '../services'
 import { ToggleSwitch } from '../components/ui/ToggleSwitch'
+import PkaCeremonyPanel from './hsm/PkaCeremonyPanel'
 
 const PROVIDER_TYPES = [
   { value: 'pkcs11', label: 'PKCS#11 (Local HSM)', icon: HardDrive },
@@ -60,6 +61,11 @@ export function parseCeremonyStatus(provider) {
   return { open: false, connected_count: 0 }
 }
 
+/** Schemes with an n-of-m keyholder roster (threshold and total). */
+export function usesQuorum(scheme) {
+  return ['shares', 'pka'].includes(scheme || 'shares')
+}
+
 export function buildRamClientCommand(ramClientUrl) {
   if (!ramClientUrl) return ''
   return `ram-client ${ramClientUrl}`
@@ -70,6 +76,33 @@ const ACCESS_RANK = { waiting: 0, session: 1, card: 2, readable: 3 }
 
 export function accessStepReached(access, step) {
   return (ACCESS_RANK[access] ?? 0) >= (ACCESS_RANK[step] ?? 0)
+}
+
+/** Ordered setup lines for the signing window. Keys are i18n paths. */
+export function ceremonyGuideKeys(provider, open) {
+  const scheme = provider?.device_scheme || 'shares'
+  if (scheme === 'none') return ['hsm.ceremony.guide.none']
+  if (scheme === 'domains') return ['hsm.ceremony.guide.domains']
+  if (!open) {
+    return [scheme === 'random' ? 'hsm.ceremony.guide.randomClosed' : 'hsm.ceremony.guide.sharesClosed']
+  }
+  if (provider?.wipe_confirmed) return ['hsm.ceremony.guide.closeNow']
+  if (provider?.key_assembled) {
+    return [
+      scheme === 'random' ? 'hsm.ceremony.guide.randomLive' : 'hsm.ceremony.guide.sharesLive',
+      'hsm.ceremony.guide.wipeThenClose',
+    ]
+  }
+  if (scheme === 'random') {
+    if (provider?.has_wrapped_root) {
+      return ['hsm.ceremony.guide.randomRestore1', 'hsm.ceremony.guide.randomRestore2', 'hsm.ceremony.guide.wipeThenClose']
+    }
+    return ['hsm.ceremony.guide.randomFirst1', 'hsm.ceremony.guide.randomFirst2', 'hsm.ceremony.guide.randomFirst3', 'hsm.ceremony.guide.wipeThenClose']
+  }
+  if (provider?.has_wrapped_root) {
+    return ['hsm.ceremony.guide.sharesRestore1', 'hsm.ceremony.guide.sharesRestore2', 'hsm.ceremony.guide.wipeThenClose']
+  }
+  return ['hsm.ceremony.guide.sharesFirst1', 'hsm.ceremony.guide.sharesFirst2', 'hsm.ceremony.guide.sharesFirst3', 'hsm.ceremony.guide.wipeThenClose']
 }
 
 export default function HSMPage() {
@@ -236,6 +269,10 @@ export default function HSMPage() {
 
   const handleSave = async (formData) => {
     try {
+      if (formData?.type === 'sc-hsm-cloud' && formData.config?.device_scheme === 'none') {
+        showError(t('hsm.scHsmCloudConfig.noneRemoved'))
+        return
+      }
       if (modalMode === 'create') {
         await hsmService.createProvider(formData)
         showSuccess(t('messages.success.create.provider'))
@@ -392,7 +429,10 @@ export default function HSMPage() {
   }
 
   const handleCreateRootKey = async (provider, custodian) => {
-    const typed = await showPrompt(t('hsm.ceremony.createPrompt', {
+    const promptKey = (provider.device_scheme || 'shares') === 'random'
+      ? 'hsm.ceremony.createPromptRandom'
+      : 'hsm.ceremony.createPrompt'
+    const typed = await showPrompt(t(promptKey, {
       name: custodian.username || custodian.name || `#${custodian.share_index}`,
     }), {
       title: t('hsm.ceremony.createTitle'),
@@ -791,7 +831,7 @@ export default function HSMPage() {
           {isScHsm && (
             <CompactGrid>
               <CompactField autoIcon="token" label={t('hsm.scHsmCloudConfig.tokenLabel')} value={provider.token_label || provider.sc_token_label || '-'} copyable />
-              {(provider.device_scheme || 'shares') === 'shares' ? (
+              {usesQuorum(provider.device_scheme) ? (
                 <>
                   <CompactField autoIcon="threshold" label={t('hsm.scHsmCloudConfig.thresholdN')} value={provider.threshold_n ?? '-'} />
                   <CompactField autoIcon="total" label={t('hsm.scHsmCloudConfig.totalM')} value={provider.total_m ?? '-'} />
@@ -807,7 +847,20 @@ export default function HSMPage() {
           )}
         </CompactSection>
 
-        {isScHsm && (
+        {isScHsm && provider.device_scheme === 'pka' && (
+          <PkaCeremonyPanel
+            provider={provider}
+            canWriteHsm={canWriteHsm}
+            canContributeHsm={canContributeHsm}
+            onRefresh={() => refreshProviderDetail(provider.id)}
+            onLock={() => handleWipeAssembly(provider)}
+            onClose={() => handleEndCeremony(provider)}
+            ocspAckChecked={ocspAckChecked}
+            setOcspAckChecked={setOcspAckChecked}
+          />
+        )}
+
+        {isScHsm && provider.device_scheme !== 'pka' && (
           <CompactSection title={t('hsm.ceremony.title')}>
             <div className="space-y-3 text-xs">
               <div className="flex flex-wrap items-center gap-2">
@@ -854,7 +907,14 @@ export default function HSMPage() {
               {!bridge.reachable && bridge.error && (
                 <p className="text-2xs text-text-tertiary break-all">{bridge.error}</p>
               )}
-              <p className="text-text-secondary">{t('hsm.ceremony.tokenReadyHint')}</p>
+              <div>
+                <p className="text-text-primary mb-1 font-medium">{t('hsm.ceremony.whatNext')}</p>
+                <ol className="list-decimal pl-4 space-y-1 text-text-secondary">
+                  {ceremonyGuideKeys(provider, ceremony.open).map((key) => (
+                    <li key={key}>{t(key, { n: provider.threshold_n, m: provider.total_m })}</li>
+                  ))}
+                </ol>
+              </div>
 
               {provider.ocsp_responder_warning && ceremony.open && (
                 <div className="p-2.5 rounded-lg border border-yellow-500/30 bg-yellow-500/10 space-y-2">
@@ -877,18 +937,20 @@ export default function HSMPage() {
                 </div>
               )}
 
-              <div>
-                <p className="text-text-tertiary mb-1 font-medium">{t('hsm.ceremony.operatorActions')}</p>
-                <ul className="list-disc pl-4 space-y-0.5 text-text-secondary">
-                  <li>{t('hsm.ceremony.actions.publishCrl')}</li>
-                  <li>{t('hsm.ceremony.actions.revokeSubordinate')}</li>
-                  <li>{t('hsm.ceremony.actions.revokeEndEntity')}</li>
-                  <li>{t('hsm.ceremony.actions.issueSubordinate')}</li>
-                  <li>{t('hsm.ceremony.actions.renewRoot')}</li>
-                  <li>{t('hsm.ceremony.actions.ocspResponder')}</li>
-                  <li>{t('hsm.ceremony.actions.rollRootKey')}</li>
-                </ul>
-              </div>
+              {provider.key_assembled && (
+                <div>
+                  <p className="text-text-tertiary mb-1 font-medium">{t('hsm.ceremony.whileKeyPresent')}</p>
+                  <ul className="list-disc pl-4 space-y-0.5 text-text-secondary">
+                    <li>{t('hsm.ceremony.actions.publishCrl')}</li>
+                    <li>{t('hsm.ceremony.actions.revokeSubordinate')}</li>
+                    <li>{t('hsm.ceremony.actions.revokeEndEntity')}</li>
+                    <li>{t('hsm.ceremony.actions.issueSubordinate')}</li>
+                    <li>{t('hsm.ceremony.actions.renewRoot')}</li>
+                    <li>{t('hsm.ceremony.actions.ocspResponder')}</li>
+                    <li>{t('hsm.ceremony.actions.rollRootKey')}</li>
+                  </ul>
+                </div>
+              )}
 
               {(canWriteHsm || canContributeHsm) && (
                 <div className="flex flex-wrap gap-2">
@@ -900,7 +962,7 @@ export default function HSMPage() {
                   )}
                   {ceremony.open && canWriteHsm && (
                     <>
-                      {provider.key_assembled && (provider.device_scheme || 'shares') === 'shares' && (
+                      {provider.key_assembled && ((provider.device_scheme || 'shares') === 'shares' || (provider.device_scheme || 'shares') === 'random') && (
                         <Button
                           type="button"
                           size="sm"
@@ -946,6 +1008,13 @@ export default function HSMPage() {
                         const isAssembly = provider.assembly_slot != null
                           && Number(provider.assembly_slot) === Number(c.share_index)
                         const isMine = c.user_id === currentUserId || c.is_me
+                        const scheme = provider.device_scheme || 'shares'
+                        const randomReady = scheme === 'random' && c.card_state === 'has_dkek'
+                        const tokenStateText = randomReady
+                          ? t('hsm.ceremony.tokenState.randomReady')
+                          : scheme === 'random' && c.card_state && c.card_state !== 'has_dkek'
+                            ? t('hsm.ceremony.tokenState.randomNeedsReinit')
+                            : t(`hsm.ceremony.tokenState.${c.card_state}`)
                         const showCommand = isMine && (canContributeHsm || canWriteHsm) && c.ram_client_url
                         const command = buildRamClientCommand(c.ram_client_url)
                         return (
@@ -985,79 +1054,6 @@ export default function HSMPage() {
                                 )
                               })}
                             </ol>
-                            {c.probe_error && (
-                              <p className="text-2xs text-red-600 dark:text-red-400">{c.probe_error}</p>
-                            )}
-                            {!c.probe_error && c.probe_sw === '6A82' && (
-                              <p className="text-2xs text-text-secondary">{t('hsm.ceremony.noShareFile')}</p>
-                            )}
-                            {(c.status === 'connected' || c.status === 'contributed') && (canWriteHsm || isMine) && (
-                              <div className="space-y-1.5">
-                                {c.card_state && (
-                                  <p className={`text-2xs ${c.card_ready ? 'text-green-700 dark:text-green-400' : 'text-text-secondary'}`}>
-                                    {t(`hsm.ceremony.tokenState.${c.card_state}`)}
-                                  </p>
-                                )}
-                                <div className="flex flex-wrap gap-2">
-                                  <Button
-                                    type="button"
-                                    size="sm"
-                                    variant="secondary"
-                                    onClick={() => handleInspectToken(provider, c)}
-                                    disabled={ceremonyBusy}
-                                  >
-                                    {t('hsm.ceremony.checkToken')}
-                                  </Button>
-                                  {c.card_state && !c.card_ready && (
-                                    <Button
-                                      type="button"
-                                      size="sm"
-                                      variant="danger"
-                                      onClick={() => handlePrepareToken(provider, c)}
-                                      disabled={ceremonyBusy || !!provider.key_assembled}
-                                      title={provider.key_assembled ? t('hsm.ceremony.prepareBlockedAssembled') : undefined}
-                                    >
-                                      {t('hsm.ceremony.prepare')}
-                                    </Button>
-                                  )}
-                                </div>
-                                {!provider.key_assembled && (
-                                  <div className="space-y-1.5 rounded border border-border-primary p-2">
-                                    <p className="text-2xs text-text-secondary">
-                                      {(provider.device_scheme || 'shares') === 'shares'
-                                        ? t('hsm.ceremony.reinitHint', { n: provider.threshold_n, m: provider.total_m })
-                                        : t('hsm.ceremony.reinitHintOther', { scheme: t(`hsm.scHsmCloudConfig.cardUse.${provider.device_scheme}`) })}
-                                    </p>
-                                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                                      <Input
-                                        label={t('hsm.ceremony.soPin')}
-                                        type="password"
-                                        noAutofill
-                                        value={(tokenPins[c.id] || {}).so_pin || ''}
-                                        onChange={(e) => setTokenPin(c.id, 'so_pin', e.target.value)}
-                                        placeholder="16 hex"
-                                      />
-                                      <Input
-                                        label={t('hsm.ceremony.userPin')}
-                                        type="password"
-                                        noAutofill
-                                        value={(tokenPins[c.id] || {}).user_pin || ''}
-                                        onChange={(e) => setTokenPin(c.id, 'user_pin', e.target.value)}
-                                      />
-                                    </div>
-                                    <Button
-                                      type="button"
-                                      size="sm"
-                                      variant="danger"
-                                      onClick={() => handleReinitializeToken(provider, c)}
-                                      disabled={ceremonyBusy}
-                                    >
-                                      {t('hsm.ceremony.reinitialize')}
-                                    </Button>
-                                  </div>
-                                )}
-                              </div>
-                            )}
                             {showCommand && (
                               <div>
                                 <span className="text-text-tertiary block mb-0.5">{t('hsm.ceremony.yourCommand')}:</span>
@@ -1076,26 +1072,104 @@ export default function HSMPage() {
                                 </div>
                               </div>
                             )}
-                            {ceremony.open && canWriteHsm && !provider.key_assembled && (provider.device_scheme || 'shares') === 'shares' && (c.status === 'connected' || c.status === 'contributed') && (
-                              <Button
-                                type="button"
-                                size="sm"
-                                onClick={() => handleCreateRootKey(provider, c)}
-                                disabled={ceremonyBusy}
-                              >
-                                {t('hsm.ceremony.createHere')}
-                              </Button>
+                            {c.probe_error && (
+                              <p className="text-2xs text-red-600 dark:text-red-400">{c.probe_error}</p>
                             )}
-                            {ceremony.open && canWriteHsm && !isAssembly && (provider.device_scheme || 'shares') === 'shares' && (c.status === 'connected' || c.status === 'contributed') && (
-                              <Button
-                                type="button"
-                                size="sm"
-                                variant="secondary"
-                                onClick={() => handleSetAssemblySlot(provider, c)}
-                                disabled={ceremonyBusy}
-                              >
-                                {t('hsm.ceremony.setAssembly')}
-                              </Button>
+                            {!c.probe_error && c.probe_sw === '6A82' && scheme === 'shares' && (
+                              <p className="text-2xs text-text-secondary">{t('hsm.ceremony.noShareFile')}</p>
+                            )}
+                            {(c.status === 'connected' || c.status === 'contributed') && (canWriteHsm || isMine) && (
+                              <div className="space-y-1.5">
+                                {c.card_state && (
+                                  <p className={`text-2xs ${c.card_ready || randomReady ? 'text-green-700 dark:text-green-400' : 'text-text-secondary'}`}>
+                                    {tokenStateText}
+                                  </p>
+                                )}
+                                <div className="flex flex-wrap gap-2">
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="secondary"
+                                    onClick={() => handleInspectToken(provider, c)}
+                                    disabled={ceremonyBusy}
+                                  >
+                                    {t('hsm.ceremony.checkToken')}
+                                  </Button>
+                                  {c.card_state && !c.card_ready && scheme !== 'random' && (
+                                    <Button
+                                      type="button"
+                                      size="sm"
+                                      variant="danger"
+                                      onClick={() => handlePrepareToken(provider, c)}
+                                      disabled={ceremonyBusy || !!provider.key_assembled}
+                                      title={provider.key_assembled ? t('hsm.ceremony.prepareBlockedAssembled') : undefined}
+                                    >
+                                      {t('hsm.ceremony.prepare')}
+                                    </Button>
+                                  )}
+                                </div>
+                                {!provider.key_assembled && (
+                                  <div className="space-y-1">
+                                    <Input
+                                      label={t('hsm.ceremony.userPin')}
+                                      type="password"
+                                      noAutofill
+                                      value={(tokenPins[c.id] || {}).user_pin || ''}
+                                      onChange={(e) => setTokenPin(c.id, 'user_pin', e.target.value)}
+                                    />
+                                    <p className="text-2xs text-text-tertiary">{t('hsm.ceremony.userPinHint')}</p>
+                                  </div>
+                                )}
+                                {ceremony.open && canWriteHsm && !provider.key_assembled && (scheme === 'shares' || (randomReady && !provider.has_wrapped_root)) && (
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    onClick={() => handleCreateRootKey(provider, c)}
+                                    disabled={ceremonyBusy}
+                                  >
+                                    {t('hsm.ceremony.createHere')}
+                                  </Button>
+                                )}
+                                {ceremony.open && canWriteHsm && !isAssembly && (scheme === 'shares' || (randomReady && provider.has_wrapped_root)) && (
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="secondary"
+                                    onClick={() => handleSetAssemblySlot(provider, c)}
+                                    disabled={ceremonyBusy}
+                                  >
+                                    {t('hsm.ceremony.setAssembly')}
+                                  </Button>
+                                )}
+                                {!provider.key_assembled && (
+                                  <div className="space-y-1.5 rounded border border-border-primary p-2">
+                                    <p className="text-2xs text-text-secondary">
+                                      {scheme === 'random'
+                                        ? t('hsm.ceremony.reinitHintRandom')
+                                        : scheme === 'shares'
+                                          ? t('hsm.ceremony.reinitHint', { n: provider.threshold_n, m: provider.total_m })
+                                          : t('hsm.ceremony.reinitHintOther', { scheme: t(`hsm.scHsmCloudConfig.cardUse.${provider.device_scheme}`) })}
+                                    </p>
+                                    <Input
+                                      label={t('hsm.ceremony.soPin')}
+                                      type="password"
+                                      noAutofill
+                                      value={(tokenPins[c.id] || {}).so_pin || ''}
+                                      onChange={(e) => setTokenPin(c.id, 'so_pin', e.target.value)}
+                                      placeholder="16 hex"
+                                    />
+                                    <Button
+                                      type="button"
+                                      size="sm"
+                                      variant="danger"
+                                      onClick={() => handleReinitializeToken(provider, c)}
+                                      disabled={ceremonyBusy}
+                                    >
+                                      {t('hsm.ceremony.reinitialize')}
+                                    </Button>
+                                  </div>
+                                )}
+                              </div>
                             )}
                           </div>
                         )
@@ -1319,7 +1393,9 @@ export function ProviderModal({ provider, hsmStatus, onSave, onClose }) {
     openbao_namespace: provider?.openbao_namespace || '',
     openbao_tls_skip_verify: provider?.openbao_tls_skip_verify ?? false,
     sc_token_label: provider?.token_label || provider?.sc_token_label || '',
-    device_scheme: provider?.device_scheme || 'shares',
+    // New providers default to public key authentication: no key material
+    // crosses the network. Older providers keep the scheme they were made with.
+    device_scheme: provider ? (provider.device_scheme || 'shares') : 'pka',
     key_domains: provider?.key_domains ?? 1,
     threshold_n: provider?.threshold_n ?? 2,
     total_m: provider?.total_m ?? 3,
@@ -1347,7 +1423,7 @@ export function ProviderModal({ provider, hsmStatus, onSave, onClose }) {
   // Keep custodian rows aligned with total_m (share indices 1..m). Never hold share material.
   useEffect(() => {
     if (formData.provider_type !== 'sc-hsm-cloud') return
-    const shares = (formData.device_scheme || 'shares') === 'shares'
+    const shares = usesQuorum(formData.device_scheme)
     const m = shares ? Math.max(1, Number(formData.total_m) || 1) : 1
     setFormData(prev => {
       const current = prev.custodians || []
@@ -1411,8 +1487,8 @@ export function ProviderModal({ provider, hsmStatus, onSave, onClose }) {
       const scheme = formData.device_scheme || 'shares'
       config.token_label = formData.sc_token_label
       config.device_scheme = scheme
-      config.threshold_n = scheme === 'shares' ? (Number(formData.threshold_n) || 1) : 1
-      config.total_m = scheme === 'shares' ? (Number(formData.total_m) || 1) : 1
+      config.threshold_n = usesQuorum(scheme) ? (Number(formData.threshold_n) || 1) : 1
+      config.total_m = usesQuorum(scheme) ? (Number(formData.total_m) || 1) : 1
       if (scheme === 'domains') config.key_domains = Number(formData.key_domains) || 1
       config.custodians = (formData.custodians || [])
         .filter(c => c.user_id !== '' && c.user_id != null)
@@ -1540,17 +1616,29 @@ export function ProviderModal({ provider, hsmStatus, onSave, onClose }) {
             value={formData.device_scheme || 'shares'}
             onChange={value => handleChange('device_scheme', value)}
             options={[
+              { value: 'pka', label: t('hsm.scHsmCloudConfig.cardUse.pka') },
               { value: 'shares', label: t('hsm.scHsmCloudConfig.cardUse.shares') },
-              { value: 'none', label: t('hsm.scHsmCloudConfig.cardUse.none') },
               { value: 'random', label: t('hsm.scHsmCloudConfig.cardUse.random') },
               { value: 'domains', label: t('hsm.scHsmCloudConfig.cardUse.domains') },
             ]}
           />
+          {formData.device_scheme === 'pka' && (
+            <p className="text-xs text-text-secondary">{t('hsm.scHsmCloudConfig.pkaHint')}</p>
+          )}
+          {['shares', 'random', 'domains'].includes(formData.device_scheme) && (
+            <p className="text-xs text-status-warning">{t('hsm.scHsmCloudConfig.legacyWarning')}</p>
+          )}
+          {formData.device_scheme === 'none' && (
+            <p className="text-xs text-text-secondary">{t('hsm.scHsmCloudConfig.noneRemoved')}</p>
+          )}
           {(formData.device_scheme || 'shares') === 'shares' && (
             <p className="text-xs text-text-secondary">{t('hsm.scHsmCloudConfig.sharesHint')}</p>
           )}
-          {(formData.device_scheme || 'shares') !== 'shares' && (
-            <p className="text-xs text-text-secondary">{t('hsm.scHsmCloudConfig.otherHint')}</p>
+          {formData.device_scheme === 'random' && (
+            <p className="text-xs text-text-secondary">{t('hsm.scHsmCloudConfig.randomHint')}</p>
+          )}
+          {formData.device_scheme === 'domains' && (
+            <p className="text-xs text-text-secondary">{t('hsm.scHsmCloudConfig.domainsHint')}</p>
           )}
           {formData.device_scheme === 'domains' && (
             <Input
@@ -1562,7 +1650,7 @@ export function ProviderModal({ provider, hsmStatus, onSave, onClose }) {
               onChange={e => handleChange('key_domains', e.target.value ? parseInt(e.target.value, 10) : 1)}
             />
           )}
-          {(formData.device_scheme || 'shares') === 'shares' && (
+          {usesQuorum(formData.device_scheme) && (
           <div className="grid grid-cols-2 gap-4">
             <Input
               label={t('hsm.scHsmCloudConfig.thresholdN')}
@@ -1584,14 +1672,16 @@ export function ProviderModal({ provider, hsmStatus, onSave, onClose }) {
           )}
           <div className="space-y-2">
             <p className="text-sm font-medium text-text-primary">
-              {(formData.device_scheme || 'shares') === 'shares'
+              {usesQuorum(formData.device_scheme)
                 ? t('hsm.scHsmCloudConfig.custodians')
                 : t('hsm.scHsmCloudConfig.cardHolder')}
             </p>
             <p className="text-2xs text-text-tertiary">
-              {(formData.device_scheme || 'shares') === 'shares'
-                ? t('hsm.scHsmCloudConfig.custodiansHint')
-                : t('hsm.scHsmCloudConfig.cardHolderHint')}
+              {formData.device_scheme === 'pka'
+                ? t('hsm.scHsmCloudConfig.pkaCustodiansHint')
+                : usesQuorum(formData.device_scheme)
+                  ? t('hsm.scHsmCloudConfig.custodiansHint')
+                  : t('hsm.scHsmCloudConfig.cardHolderHint')}
             </p>
             {(formData.custodians || []).map((c, index) => (
               <div key={c.share_index || index} className="grid grid-cols-[4rem_1fr] gap-3 items-end">
