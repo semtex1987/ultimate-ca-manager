@@ -24,6 +24,7 @@ SAMPLE_PATH = {
     '/ssh/setup/': '/ssh/setup/host',
     '/ADPolicyProvider_CEP_': '/ADPolicyProvider_CEP_UsernamePassword/service.svc',
     '/ADCertificateService_CES_': '/ADCertificateService_CES_UsernamePassword/service.svc',
+    '/hsm/ram/': '/hsm/ram/connect-token-example',
 }
 
 
@@ -79,7 +80,8 @@ class TestABarePathIsNotAPrefix:
 class TestTheLimitsStayProtocolSized:
     NEWLY_CLASSIFIED = ['/tsa', '/ca/x.crt', '/ssh/setup/x',
                         '/ADPolicyProvider_CEP_UsernamePassword/service.svc',
-                        '/ADCertificateService_CES_UsernamePassword/service.svc']
+                        '/ADCertificateService_CES_UsernamePassword/service.svc',
+                        '/hsm/ram/connect-token-example']
 
     @pytest.mark.parametrize('path', NEWLY_CLASSIFIED)
     def test_classifying_a_path_never_throttles_it(self, path, stock_limits):

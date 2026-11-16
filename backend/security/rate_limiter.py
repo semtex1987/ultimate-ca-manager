@@ -143,6 +143,11 @@ class RateLimitConfig:
             # these had `_default` before. Separate bucket, same rate.
             '/ADPolicyProvider_CEP_': {'rpm': standard_rpm, 'burst': standard_burst},
             '/ADCertificateService_CES_': {'rpm': standard_rpm, 'burst': standard_burst},
+            # SmartCard-HSM ceremony bridge (RAMOverHTTP). One request per
+            # APDU round trip, so registering keyholders or a signing window
+            # is a burst of machine traffic; it must neither eat the
+            # operator's admin quota nor be starved by it.
+            '/hsm/ram/': {'rpm': standard_rpm, 'burst': standard_burst},
 
             # Default for unspecified endpoints
             '_default': {'rpm': standard_rpm, 'burst': standard_burst}
