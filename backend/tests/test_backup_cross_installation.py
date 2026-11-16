@@ -426,6 +426,15 @@ def _seed_source():
     # two numbers that named a different row on every other installation.
     roles[1].inherits_from = roles[0].id
     hsm_providers[1].created_by = users[1].id
+    # The keyholder roster of a quorum provider: the slot and the public key
+    # travel, the connect token does not (the archive leaves it out and the
+    # restore issues a new one).
+    for index, suffix in ((1, 'a'), (2, 'b')):
+        add('hsm_custodians', provider_id=hsm_providers[1].id,
+            user_id=users[1].id, share_index=index,
+            display_name=f'xinst-holder-{suffix}',
+            connect_token_enc=f'xinst-connect-token-{suffix}',
+            auth_public_key=f'xinst-public-key-{suffix}')
     for column in ('totp_secret', 'backup_codes'):
         secret(users[1], 'users', column)
 
@@ -695,8 +704,8 @@ RESTORABLE_SECTIONS = tuple(
     name for name in (
         'users', 'groups', 'custom_roles', 'sso_providers',
         'certificate_templates', 'certificate_authorities', 'certificates',
-        'revoked_serials', 'hsm_providers', 'hsm_keys', 'api_keys',
-        'auth_certificates', 'certificate_policies', 'approval_requests',
+        'revoked_serials', 'hsm_providers', 'hsm_keys', 'hsm_custodians',
+        'api_keys', 'auth_certificates', 'certificate_policies', 'approval_requests',
         'dns_providers', 'acme_accounts', 'acme_eab_credentials',
         'acme_domains', 'acme_local_domains', 'acme_client_accounts',
         'acme_client_orders',

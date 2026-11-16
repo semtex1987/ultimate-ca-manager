@@ -177,6 +177,24 @@ SECTIONS: Dict[str, Section] = {
         exclude={**_SURROGATE},
         references={'provider_id': 'hsm_providers'},
     ),
+    'hsm_custodians': Section(
+        model='models.hsm:HsmCustodian',
+        # One keyholder per slot of a provider's quorum: the slot is what
+        # names the same keyholder on another installation.
+        identity=('provider_id', 'share_index'),
+        exclude={
+            **_SURROGATE,
+            # A bearer credential for the ceremony bridge, good for one
+            # signing window. Copying it would let whoever holds an old
+            # archive connect to a ceremony on the restored installation; the
+            # restore issues a fresh one instead.
+            'connect_token_enc': 'single-window bearer token, reissued on restore',
+        },
+        # `auth_public_key` is the keyholder's public key export (public by
+        # definition): it is what the root HSM was registered with, and
+        # without it a restored provider could not verify any keyholder.
+        references={'provider_id': 'hsm_providers', 'user_id': 'users'},
+    ),
     'api_keys': Section(
         model='models.api_key:APIKey',
         # The hash, not the prefix: the prefix is nullable and rows predating

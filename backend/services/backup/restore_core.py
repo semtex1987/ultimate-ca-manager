@@ -90,7 +90,8 @@ RESTORED_SECTIONS = set(GENERIC_SECTIONS) | {
     'users', 'certificate_authorities', 'certificates', 'revoked_serials',
     'acme_accounts', 'acme_eab_credentials', 'configuration', 'groups',
     'custom_roles', 'certificate_templates', 'trusted_certificates',
-    'sso_providers', 'hsm_providers', 'hsm_keys', 'api_keys', 'smtp_config',
+    'sso_providers', 'hsm_providers', 'hsm_keys', 'hsm_custodians',
+    'api_keys', 'smtp_config',
     'notification_config', 'certificate_policies', 'auth_certificates',
     'dns_providers', 'acme_domains', 'acme_local_domains', 'ssh_cas',
     'ssh_certificates', 'microsoft_cas', 'msca_requests', 'scan_profiles',
@@ -445,6 +446,7 @@ class RestoreCoreMixin:
         self._restore_microsoft_cas(backup_data, results)
         self._restore_scan_profiles(backup_data, results)
         self._restore_hsm_keys(backup_data, results, plan)
+        self._restore_hsm_custodians(backup_data, results, plan)
         self._restore_approval_requests(backup_data, results, plan)
         self._restore_acme_client_orders(backup_data, results, plan)
         self._restore_https_files(backup_data, results, staged)

@@ -510,6 +510,56 @@ class RestoreExtendedMixin:
 
         db.session.flush()
 
+    def _restore_hsm_custodians(self, backup_data: Dict, results: Dict,
+                                plan: Optional[RestorePlan] = None) -> None:
+        """Restore the keyholder roster of quorum-controlled HSM providers.
+
+        The roster is the provider's access policy: who holds which slot and,
+        for public key authentication, the public key the root HSM was
+        registered with. A provider restored without it has a quorum nobody
+        can satisfy.
+
+        The connect token is not in the archive. A new row gets a fresh one;
+        an existing row keeps its own, so a restore does not reopen a URL the
+        target already rotated.
+        """
+        results.setdefault('hsm_custodians', 0)
+        rows = backup_data.get('hsm_custodians', [])
+        if not rows:
+            return
+        try:
+            from models.hsm import HsmCustodian
+        except ImportError:
+            _missing_support('hsm_custodians', rows, 'HSM')
+            return
+        import secrets
+
+        plan = plan if plan is not None else RestorePlan.build(backup_data)
+        reindex_reference_targets('hsm_custodians', plan)
+
+        for position, c_data in enumerate(rows):
+            where = f"HSM keyholder {c_data.get('share_index') or position}"
+            _required(where, c_data, 'provider_id')
+            share_index = _required(where, c_data, 'share_index')
+            provider_id = _reference(where, 'hsm_custodians', c_data,
+                                     'provider_id', plan)
+
+            row = _existing_row('hsm_custodians',
+                                {'provider_id': provider_id,
+                                 'share_index': share_index})
+            if row is None:
+                # provider_id, share_index and connect_token_enc are NOT NULL
+                row = HsmCustodian(provider_id=provider_id,
+                                   share_index=share_index,
+                                   display_name=c_data.get('display_name') or '')
+                row.set_connect_token(secrets.token_urlsafe(32))
+                db.session.add(row)
+
+            apply_columns(row, 'hsm_custodians', c_data, plan)
+            results['hsm_custodians'] += 1
+
+        db.session.flush()
+
     def _restore_approval_requests(self, backup_data: Dict, results: Dict,
                                    plan: Optional[RestorePlan] = None) -> None:
         """Restore approval requests, once and with their dates.
