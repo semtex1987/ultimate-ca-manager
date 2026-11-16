@@ -565,20 +565,44 @@ fi
 # Order: pcscd → ucm-ram-bridge → Gunicorn. Bridge talks to the pcscd socket
 # and speaks the vpicc side of vpcd (package default port 35963). Start the
 # bridge only when the backend module is present so older images still boot.
+# A leftover socket from a dead pcscd still looks ready. PKCS#11 then
+# reports "token '' not found" because no reader is actually served.
+pcsc_pid_alive() {
+    local pidfile pid
+    for pidfile in /run/pcscd/pcscd.pid /var/run/pcscd/pcscd.pid; do
+        [ -f "$pidfile" ] || continue
+        pid=$(tr -cd '0-9' < "$pidfile")
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 if [ "$(id -u)" = "0" ] && command -v pcscd >/dev/null 2>&1; then
     echo -e "${CYAN}💳 Starting pcscd...${NC}"
     mkdir -p /run/pcscd /var/run/pcscd
-    # Daemonize (default). Ignore "already running" so restarts are safe.
-    if ! pcscd 2>/dev/null; then
-        echo -e "${YELLOW}   ⚠️  pcscd start returned non-zero (may already be running)${NC}"
-    fi
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        if [ -S /run/pcscd/pcscd.comm ] || [ -S /var/run/pcscd/pcscd.comm ]; then
-            echo -e "${GREEN}✅ pcscd socket ready${NC}"
-            break
+    if pcsc_pid_alive; then
+        echo -e "${GREEN}✅ pcscd already running${NC}"
+    else
+        rm -f /run/pcscd/pcscd.comm /run/pcscd/pcscd.pid \
+            /var/run/pcscd/pcscd.comm /var/run/pcscd/pcscd.pid
+        if ! pcscd 2>/dev/null; then
+            echo -e "${YELLOW}   ⚠️  pcscd start returned non-zero${NC}"
         fi
-        sleep 0.2
-    done
+        pcsc_ready=0
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if pcsc_pid_alive && { [ -S /run/pcscd/pcscd.comm ] || [ -S /var/run/pcscd/pcscd.comm ]; }; then
+                echo -e "${GREEN}✅ pcscd socket ready${NC}"
+                pcsc_ready=1
+                break
+            fi
+            sleep 0.2
+        done
+        if [ "$pcsc_ready" != "1" ]; then
+            echo -e "${YELLOW}   ⚠️  pcscd is not running; SmartCard-HSM key generation will not see a token${NC}"
+        fi
+    fi
 elif [ "$(id -u)" != "0" ]; then
     echo -e "${YELLOW}⚠️  Not root; cannot start pcscd (SmartCard-HSM bridge needs PC/SC)${NC}"
 fi
